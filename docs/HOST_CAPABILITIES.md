@@ -163,6 +163,7 @@ wasmdev-host exec [--dir HOST[::GUEST][:ro]]... [--env K=V]... [--cwd GUEST] \
 stdio inherited, exit code propagated, `WASMDEV_TRACE_PROC=1` logs one line per
 process (wall time, module load time, cache hit kind). See
 `experiments/e5-spawn/run-go.sh`.
+
 ## Module cache
 
 Compiled modules and components are cached in memory (key: SHA-256 of
