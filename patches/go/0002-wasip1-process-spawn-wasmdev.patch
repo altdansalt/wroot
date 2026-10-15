@@ -1,0 +1,463 @@
+diff --git a/src/os/exec/lp_wasip1.go b/src/os/exec/lp_wasip1.go
+new file mode 100644
+index 0000000..9fcaeb6
+--- /dev/null
++++ b/src/os/exec/lp_wasip1.go
+@@ -0,0 +1,73 @@
++// Copyright 2010 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build wasip1
++
++package exec
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"syscall"
++)
++
++// ErrNotFound is the error resulting if a path search failed to find an executable file.
++var ErrNotFound = errors.New("executable file not found in $PATH")
++
++// findExecutable: WASI has no execute permission bits; any regular file
++// may be a wasm module the host can run (wasmdev patch).
++func findExecutable(file string) error {
++	d, err := os.Stat(file)
++	if err != nil {
++		return err
++	}
++	if d.Mode().IsDir() {
++		return syscall.EISDIR
++	}
++	return nil
++}
++
++func lookPath(file string) (string, error) {
++	// NOTE(rsc): I wish we could use the Plan 9 behavior here
++	// (only bypass the path if file begins with / or ./ or ../)
++	// but that would not match all the Unix shells.
++
++	if err := validateLookPath(file); err != nil {
++		return "", &Error{file, err}
++	}
++
++	if strings.Contains(file, "/") {
++		err := findExecutable(file)
++		if err == nil {
++			return file, nil
++		}
++		return "", &Error{file, err}
++	}
++	path := os.Getenv("PATH")
++	for _, dir := range filepath.SplitList(path) {
++		if dir == "" {
++			// Unix shell semantics: path element "" means "."
++			dir = "."
++		}
++		path := filepath.Join(dir, file)
++		if err := findExecutable(path); err == nil {
++			if !filepath.IsAbs(path) {
++				if execerrdot.Value() != "0" {
++					return path, &Error{file, ErrDot}
++				}
++				execerrdot.IncNonDefault()
++			}
++			return path, nil
++		}
++	}
++	return "", &Error{file, ErrNotFound}
++}
++
++// lookExtensions is a no-op on non-Windows platforms, since
++// they do not restrict executables to specific extensions.
++func lookExtensions(path, dir string) (string, error) {
++	return path, nil
++}
+diff --git a/src/os/exec/lp_wasm.go b/src/os/exec/lp_wasm.go
+index 1de9076..b5ff502 100644
+--- a/src/os/exec/lp_wasm.go
++++ b/src/os/exec/lp_wasm.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build wasm
++//go:build js && wasm
+ 
+ package exec
+ 
+diff --git a/src/os/pipe_wasip1.go b/src/os/pipe_wasip1.go
+new file mode 100644
+index 0000000..133fb9d
+--- /dev/null
++++ b/src/os/pipe_wasip1.go
+@@ -0,0 +1,22 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build wasip1
++
++package os
++
++import "syscall"
++
++// Pipe returns a connected pair of Files; reads from r return bytes written to w.
++// It returns the files and an error, if any.
++//
++// wasmdev patch: pipes are provided by the wasmdev host (a connected
++// stream socket pair), and are polled by the netpoller.
++func Pipe() (r *File, w *File, err error) {
++	var p [2]int
++	if e := syscall.Pipe(p[0:]); e != nil {
++		return nil, nil, NewSyscallError("pipe", e)
++	}
++	return newFile(p[0], "|0", kindPipe, false), newFile(p[1], "|1", kindPipe, false), nil
++}
+diff --git a/src/os/pipe_wasm.go b/src/os/pipe_wasm.go
+index 87a29b1..0220633 100644
+--- a/src/os/pipe_wasm.go
++++ b/src/os/pipe_wasm.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build wasm
++//go:build js && wasm
+ 
+ package os
+ 
+diff --git a/src/os/wait_unimp.go b/src/os/wait_unimp.go
+index 810e35d..0655e03 100644
+--- a/src/os/wait_unimp.go
++++ b/src/os/wait_unimp.go
+@@ -5,7 +5,7 @@
+ // aix, darwin, js/wasm, openbsd, solaris and wasip1/wasm don't implement
+ // waitid/wait6.
+ 
+-//go:build aix || darwin || (js && wasm) || openbsd || solaris || wasip1
++//go:build aix || darwin || (js && wasm) || openbsd || solaris
+ 
+ package os
+ 
+diff --git a/src/os/wait_wasip1.go b/src/os/wait_wasip1.go
+new file mode 100644
+index 0000000..03d8add
+--- /dev/null
++++ b/src/os/wait_wasip1.go
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build wasip1
++
++package os
++
++import "syscall"
++
++// blockUntilWaitable blocks until a call to p.Wait will succeed
++// immediately, and reports whether it has done so.
++//
++// wasmdev patch: wasip1 programs are single-threaded, so a blocking
++// host wait would freeze every goroutine (including the ones copying
++// the child's output). Instead, read the child's exit fd until EOF
++// through the netpoller, which parks only this goroutine.
++func (p *Process) blockUntilWaitable() (bool, error) {
++	fd, ok := syscall.WasmdevTakeExitFD(p.Pid)
++	if !ok {
++		return false, nil
++	}
++	f := newFile(fd, "|exit", kindPipe, false)
++	var buf [16]byte
++	for {
++		n, err := f.Read(buf[:])
++		if err != nil || n == 0 {
++			break
++		}
++	}
++	f.Close()
++	return true, nil
++}
+diff --git a/src/syscall/fs_wasip1.go b/src/syscall/fs_wasip1.go
+index 2be32b2..db01d69 100644
+--- a/src/syscall/fs_wasip1.go
++++ b/src/syscall/fs_wasip1.go
+@@ -524,6 +524,10 @@ func Open(path string, openmode int, perm uint32) (int, error) {
+ 	if path == "" {
+ 		return -1, EINVAL
+ 	}
++	if path == "/dev/null" {
++		// wasmdev patch: host-provided null device.
++		return openDevNull(openmode)
++	}
+ 	dirFd, pathPtr, pathLen := preparePath(path)
+ 	return openat(dirFd, pathPtr, pathLen, openmode, perm)
+ }
+@@ -939,9 +943,6 @@ func Dup2(fd, newfd int) error {
+ 	return ENOSYS
+ }
+ 
+-func Pipe(fd []int) error {
+-	return ENOSYS
+-}
+ 
+ func RandomGet(b []byte) error {
+ 	// random_get in WASI preview1 takes a 32-bit length.
+diff --git a/src/syscall/proc_wasmdev_wasip1.go b/src/syscall/proc_wasmdev_wasip1.go
+new file mode 100644
+index 0000000..0ee477d
+--- /dev/null
++++ b/src/syscall/proc_wasmdev_wasip1.go
+@@ -0,0 +1,197 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build wasip1
++
++// wasmdev patch: child processes on top of the wasmdev host's
++// "wasmdev_proc" imports (see wasmdev docs/HOST_CAPABILITIES.md).
++// A child is another wasm module run by the host; it inherits the
++// caller's preopens. spawn never blocks: it returns a pid and an
++// "exit fd" (a stream socket that reaches EOF when the child exits),
++// which package os waits on through the netpoller, so other goroutines
++// keep running while children run.
++
++package syscall
++
++import (
++	"sync"
++	"unsafe"
++)
++
++//go:wasmimport wasmdev_proc spawn
++//go:noescape
++func proc_spawn(path unsafe.Pointer, pathLen size, argv unsafe.Pointer, argvLen size, env unsafe.Pointer, envLen size, dir unsafe.Pointer, dirLen size, fd0, fd1, fd2 int32, pid unsafe.Pointer, exitfd unsafe.Pointer) Errno
++
++//go:wasmimport wasmdev_proc wait
++//go:noescape
++func proc_wait(pid int32, nohang int32, status unsafe.Pointer) Errno
++
++//go:wasmimport wasmdev_proc kill
++func proc_kill(pid int32, sig int32) Errno
++
++//go:wasmimport wasmdev_proc pipe
++//go:noescape
++func proc_pipe(fds unsafe.Pointer) Errno
++
++//go:wasmimport wasmdev_proc open_null
++//go:noescape
++func proc_open_null(write int32, fd unsafe.Pointer) Errno
++
++const WNOHANG = 0x1
++
++var (
++	exitFDsMu sync.Mutex
++	exitFDs   = map[int]int{}
++)
++
++// WasmdevTakeExitFD returns (and forgets) the exit fd of child pid.
++// The caller owns the fd. Used by package os.
++func WasmdevTakeExitFD(pid int) (fd int, ok bool) {
++	exitFDsMu.Lock()
++	defer exitFDsMu.Unlock()
++	fd, ok = exitFDs[pid]
++	delete(exitFDs, pid)
++	return
++}
++
++func nulJoin(ss []string) []byte {
++	n := 0
++	for _, s := range ss {
++		n += len(s) + 1
++	}
++	b := make([]byte, 0, n+1)
++	for _, s := range ss {
++		b = append(b, s...)
++		b = append(b, 0)
++	}
++	return b
++}
++
++func bytesPtr(b []byte) unsafe.Pointer {
++	if len(b) == 0 {
++		return nil
++	}
++	return unsafe.Pointer(&b[0])
++}
++
++func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle uintptr, err error) {
++	if attr == nil {
++		attr = &ProcAttr{}
++	}
++	if argv0 == "" {
++		return 0, 0, ENOENT
++	}
++	cwd, _ := Getwd()
++	dir := attr.Dir
++	if dir == "" {
++		dir = cwd
++	} else if dir[0] != '/' {
++		dir = joinPath(cwd, dir)
++	}
++	path := argv0
++	if path[0] != '/' {
++		// As with fork+chdir+exec: relative to the child's directory.
++		path = joinPath(dir, path)
++	}
++	fds := [3]int32{-1, -1, -1}
++	for i, f := range attr.Files {
++		if f == ^uintptr(0) {
++			continue
++		}
++		if i >= 3 {
++			return 0, 0, ENOSYS // no ExtraFiles
++		}
++		fds[i] = int32(f)
++	}
++	pathb := []byte(path)
++	dirb := []byte(dir)
++	argvb := nulJoin(argv)
++	envb := nulJoin(attr.Env)
++	var p, efd int32
++	errno := proc_spawn(bytesPtr(pathb), size(len(pathb)), bytesPtr(argvb), size(len(argvb)),
++		bytesPtr(envb), size(len(envb)), bytesPtr(dirb), size(len(dirb)),
++		fds[0], fds[1], fds[2], unsafe.Pointer(&p), unsafe.Pointer(&efd))
++	if errno != 0 {
++		return 0, 0, errno
++	}
++	exitFDsMu.Lock()
++	exitFDs[int(p)] = int(efd)
++	exitFDsMu.Unlock()
++	return int(p), 0, nil
++}
++
++// Wait4 reaps child pid. Without WNOHANG it blocks the whole program
++// (wasip1 is single-threaded); package os avoids that by first waiting
++// for EOF on the exit fd in the netpoller.
++func Wait4(pid int, wstatus *WaitStatus, options int, rusage *Rusage) (wpid int, err error) {
++	var nohang int32
++	if options&WNOHANG != 0 {
++		nohang = 1
++	}
++	var st int32
++	if errno := proc_wait(int32(pid), nohang, unsafe.Pointer(&st)); errno != 0 {
++		if errno == EAGAIN && nohang != 0 {
++			return 0, nil
++		}
++		return 0, errno
++	}
++	if fd, ok := WasmdevTakeExitFD(pid); ok {
++		Close(fd)
++	}
++	if wstatus != nil {
++		*wstatus = WaitStatus(st)
++	}
++	if rusage != nil {
++		*rusage = Rusage{}
++	}
++	return pid, nil
++}
++
++func Pipe(fd []int) error {
++	if len(fd) != 2 {
++		return EINVAL
++	}
++	var fds [2]int32
++	if errno := proc_pipe(unsafe.Pointer(&fds)); errno != 0 {
++		return errno
++	}
++	fd[0], fd[1] = int(fds[0]), int(fds[1])
++	return nil
++}
++
++func openDevNull(openmode int) (int, error) {
++	var write int32
++	if openmode&(O_WRONLY|O_RDWR) != 0 {
++		write = 1
++	}
++	var fd int32
++	if errno := proc_open_null(write, unsafe.Pointer(&fd)); errno != 0 {
++		return -1, errno
++	}
++	return int(fd), nil
++}
++
++// Unix-style wait status: exit code in bits 8-15, terminating signal
++// in bits 0-6.
++type WaitStatus uint32
++
++func (w WaitStatus) Exited() bool { return w&0x7f == 0 }
++func (w WaitStatus) ExitStatus() int {
++	if !w.Exited() {
++		return -1
++	}
++	return int(w>>8) & 0xff
++}
++func (w WaitStatus) Signaled() bool { return w&0x7f != 0 }
++func (w WaitStatus) Signal() Signal {
++	if !w.Signaled() {
++		return 0
++	}
++	return Signal(w & 0x7f)
++}
++func (w WaitStatus) CoreDump() bool     { return false }
++func (w WaitStatus) Stopped() bool      { return false }
++func (w WaitStatus) Continued() bool    { return false }
++func (w WaitStatus) StopSignal() Signal { return 0 }
++func (w WaitStatus) TrapCause() int     { return -1 }
+diff --git a/src/syscall/syscall_wasip1.go b/src/syscall/syscall_wasip1.go
+index 9b5f502..5a53a1a 100644
+--- a/src/syscall/syscall_wasip1.go
++++ b/src/syscall/syscall_wasip1.go
+@@ -295,17 +295,7 @@ const (
+ 	S_IXOTH = 01
+ )
+ 
+-type WaitStatus uint32
+-
+-func (w WaitStatus) Exited() bool       { return false }
+-func (w WaitStatus) ExitStatus() int    { return 0 }
+-func (w WaitStatus) Signaled() bool     { return false }
+-func (w WaitStatus) Signal() Signal     { return 0 }
+-func (w WaitStatus) CoreDump() bool     { return false }
+-func (w WaitStatus) Stopped() bool      { return false }
+-func (w WaitStatus) Continued() bool    { return false }
+-func (w WaitStatus) StopSignal() Signal { return 0 }
+-func (w WaitStatus) TrapCause() int     { return 0 }
++// WaitStatus: see proc_wasmdev_wasip1.go (wasmdev patch).
+ 
+ // Rusage is a placeholder to allow compilation of the [os/exec] package
+ // because we need Go programs to be portable across platforms. WASI does
+@@ -396,7 +386,11 @@ func Kill(pid int, signum Signal) error {
+ 	// Any signal that the application raises to the process itself will
+ 	// be interpreted as being cause for termination.
+ 	if pid > 0 && pid != Getpid() {
+-		return ESRCH
++		// wasmdev patch: child processes (proc_wasmdev_wasip1.go).
++		if errno := proc_kill(int32(pid), int32(signum)); errno != 0 {
++			return errno
++		}
++		return nil
+ 	}
+ 	ProcExit(128 + int32(signum))
+ 	return nil
+@@ -406,13 +400,6 @@ func Sendfile(outfd int, infd int, offset *int64, count int) (written int, err e
+ 	return 0, ENOSYS
+ }
+ 
+-func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle uintptr, err error) {
+-	return 0, 0, ENOSYS
+-}
+-
+-func Wait4(pid int, wstatus *WaitStatus, options int, rusage *Rusage) (wpid int, err error) {
+-	return 0, ENOSYS
+-}
+ 
+ func Umask(mask int) int {
+ 	return 0
