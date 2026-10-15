@@ -86,6 +86,10 @@ use wasmtime_wasi_io::{
     streams::{StreamError, StreamResult},
 };
 use wiggle::tracing::instrument;
+
+// wasmdev patch: p1 socket support (see p1_socket.rs)
+#[path = "p1_socket.rs"]
+mod socket;
 use wiggle::{GuestError, GuestMemory, GuestPtr, GuestType};
 
 // Bring all WASI traits in scope that this implementation builds on.
@@ -143,6 +147,8 @@ pub struct WasiP1Ctx {
     wasi: WasiCtx,
     adapter: WasiP1Adapter,
     hostcall_fuel: usize,
+    /// wasmdev patch: listeners to expose after the preopened directories.
+    preopen_listeners: Vec<std::net::TcpListener>,
 }
 
 impl WasiP1Ctx {
@@ -152,7 +158,23 @@ impl WasiP1Ctx {
             wasi,
             adapter: WasiP1Adapter::new(),
             hostcall_fuel: 0,
+            preopen_listeners: Vec::new(),
         }
+    }
+
+    /// wasmdev patch: grant the guest an already-bound TCP listener.
+    ///
+    /// Listeners are numbered after stdio and all preopened directories
+    /// (fd = 3 + number of preopened dirs + index), so that libc/Go preopen
+    /// scans (which stop at the first `EBADF` from `fd_prestat_get`) still see
+    /// every directory. The listener starts in NONBLOCK mode, matching the
+    /// historical `wasmtime --tcplisten` behaviour that Go's `net` expects.
+    pub fn preopen_tcp_listener(&mut self, listener: std::net::TcpListener) {
+        assert!(
+            self.adapter.descriptors.is_none(),
+            "preopen_tcp_listener must be called before the guest runs"
+        );
+        self.preopen_listeners.push(listener);
     }
 
     fn consume_fuel(&mut self, fuel: usize) -> Result<()> {
@@ -339,6 +361,8 @@ enum Descriptor {
     },
     /// A fd of type [`crate::filesystem::Descriptor::File`]
     File(File),
+    /// wasmdev patch: a TCP listener or stream.
+    Socket(socket::Socket),
 }
 
 #[derive(Debug, Default)]
@@ -427,6 +451,12 @@ impl Descriptors {
                 fd: dir.0,
                 preopen_path: Some(dir.1),
             })?;
+        }
+        for l in mem::take(&mut host.preopen_listeners) {
+            let sock = socket::Socket::new(socket::SockKind::Listener(l), true)
+                .context("failed to register preopened listener")
+                .map_err(types::Error::trap)?;
+            descriptors.push(Descriptor::Socket(sock))?;
         }
         Ok(descriptors)
     }
@@ -553,6 +583,7 @@ impl Transaction<'_> {
             Descriptor::Stdin { .. } | Descriptor::Stdout { .. } | Descriptor::Stderr { .. } => {
                 Err(types::Errno::Badf.into())
             }
+            Descriptor::Socket(_) => Err(types::Errno::Badf.into()),
         }
     }
 
@@ -706,6 +737,16 @@ impl WasiP1Ctx {
                     .await?
                     .try_into()?;
                 Ok(n)
+            }
+            Descriptor::Socket(sock) => {
+                if let FdWrite::At(_) = write {
+                    return Err(types::Errno::Spipe.into());
+                }
+                let sock = sock.clone();
+                drop(t);
+                let bytes = memory.to_vec(buf)?;
+                let n = sock.write(&bytes).await.map_err(socket::errno)?;
+                Ok(n.try_into()?)
             }
             _ => Err(types::Errno::Badf.into()),
         }
@@ -862,7 +903,8 @@ wiggle::from_witx!({
             fd_filestat_set_times, fd_read, fd_pread, fd_seek, fd_sync, fd_readdir, fd_write,
             fd_pwrite, poll_oneoff, path_create_directory, path_filestat_get,
             path_filestat_set_times, path_link, path_open, path_readlink, path_remove_directory,
-            path_rename, path_symlink, path_unlink_file, fd_renumber
+            path_rename, path_symlink, path_unlink_file, fd_renumber,
+                sock_accept, sock_recv, sock_send
         }
     },
     errors: { errno => trappable Error },
@@ -881,7 +923,8 @@ pub(crate) mod sync {
                 fd_filestat_set_times, fd_read, fd_pread, fd_seek, fd_sync, fd_readdir, fd_write,
                 fd_pwrite, poll_oneoff, path_create_directory, path_filestat_get,
                 path_filestat_set_times, path_link, path_open, path_readlink, path_remove_directory,
-                path_rename, path_symlink, path_unlink_file, fd_renumber
+                path_rename, path_symlink, path_unlink_file, fd_renumber,
+                sock_accept, sock_recv, sock_send
             }
         },
         errors: { errno => trappable Error },
@@ -1381,6 +1424,8 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                 filesystem::HostDescriptor::drop(&mut self.filesystem(), fd)
                     .context("failed to call `drop`")
             }
+            // Dropping the last Arc deregisters and closes the OS socket.
+            Descriptor::Socket(_) => Ok(()),
         }
         .map_err(types::Error::trap)
     }
@@ -1476,6 +1521,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                 append,
                 ..
             }) => (fd.borrowed(), *blocking_mode, *append),
+            Descriptor::Socket(sock) => return Ok(socket::stream_fdstat(sock)),
         };
         let flags = self.filesystem().get_flags(fd.borrowed()).await?;
         let fs_filetype = self
@@ -1531,6 +1577,10 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
         flags: types::Fdflags,
     ) -> Result<(), types::Error> {
         let mut st = self.transact()?;
+        if let Some(Descriptor::Socket(sock)) = st.descriptors.used.get_mut(&u32::from(fd)) {
+            sock.nonblocking = flags.contains(types::Fdflags::NONBLOCK);
+            return Ok(());
+        }
         let File {
             append,
             blocking_mode,
@@ -1572,6 +1622,16 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
         let t = self.transact()?;
         let desc = t.get_descriptor(fd)?;
         match desc {
+            Descriptor::Socket(_) => Ok(types::Filestat {
+                dev: 0,
+                ino: 0,
+                filetype: types::Filetype::SocketStream,
+                nlink: 0,
+                size: 0,
+                atim: 0,
+                mtim: 0,
+                ctim: 0,
+            }),
             Descriptor::Stdin { isatty, .. }
             | Descriptor::Stdout { isatty, .. }
             | Descriptor::Stderr { isatty, .. } => Ok(types::Filestat {
@@ -1734,6 +1794,15 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                 memory.copy_from_slice(&read, iov)?;
                 let n = read.len().try_into()?;
                 Ok(n)
+            }
+            Descriptor::Socket(sock) => {
+                let sock = sock.clone();
+                drop(t);
+                let mut buf = vec![0; iov.len() as usize];
+                let n = sock.read(&mut buf).await.map_err(socket::errno)?;
+                let iov = iov.get_range(0..u32::try_from(n)?).unwrap();
+                memory.copy_from_slice(&buf[..n], iov)?;
+                Ok(n.try_into()?)
             }
             _ => return Err(types::Errno::Badf.into()),
         }
@@ -2360,6 +2429,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
             pollables: Vec::with_capacity(n),
             inputs: Vec::new(),
             outputs: Vec::new(),
+            sockets: Vec::new(),
         };
         let mut borrowed_pollables = Vec::with_capacity(n);
         for sub in subs.iter() {
@@ -2411,7 +2481,23 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                                 temp.inputs.push(r);
                                 ret
                             }
-                            // TODO: Support sockets
+                            Descriptor::Socket(sock) => {
+                                let ready = socket::SocketReady {
+                                    sock: sock.inner.clone(),
+                                    interest: tokio::io::Interest::READABLE,
+                                };
+                                drop(t);
+                                let r = temp.ctx.table.push(ready)?;
+                                let p = wasmtime_wasi_io::poll::subscribe(
+                                    &mut temp.ctx.table,
+                                    Resource::<socket::SocketReady>::new_borrow(r.rep()),
+                                )
+                                .map_err(types::Error::trap)?;
+                                temp.sockets.push(r);
+                                borrowed_pollables.push(p.borrowed());
+                                temp.pollables.push(p);
+                                continue;
+                            }
                             _ => return Err(types::Errno::Badf.into()),
                         }
                     };
@@ -2448,7 +2534,23 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                                 temp.outputs.push(r);
                                 ret
                             }
-                            // TODO: Support sockets
+                            Descriptor::Socket(sock) => {
+                                let ready = socket::SocketReady {
+                                    sock: sock.inner.clone(),
+                                    interest: tokio::io::Interest::WRITABLE,
+                                };
+                                drop(t);
+                                let r = temp.ctx.table.push(ready)?;
+                                let p = wasmtime_wasi_io::poll::subscribe(
+                                    &mut temp.ctx.table,
+                                    Resource::<socket::SocketReady>::new_borrow(r.rep()),
+                                )
+                                .map_err(types::Error::trap)?;
+                                temp.sockets.push(r);
+                                borrowed_pollables.push(p.borrowed());
+                                temp.pollables.push(p);
+                                continue;
+                            }
                             _ => return Err(types::Errno::Badf.into()),
                         }
                     };
@@ -2528,7 +2630,15 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                                 }
                             }
                         }
-                        // TODO: Support sockets
+                        Descriptor::Socket(_) => types::Event {
+                            userdata: sub.userdata,
+                            error: types::Errno::Success,
+                            type_: types::Eventtype::FdRead,
+                            fd_readwrite: types::EventFdReadwrite {
+                                flags: types::Eventrwflags::empty(),
+                                nbytes: 1,
+                            },
+                        },
                         _ => return Err(types::Errno::Badf.into()),
                     }
                 }
@@ -2547,7 +2657,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                                 nbytes: 1,
                             },
                         },
-                        Descriptor::File(_) => types::Event {
+                        Descriptor::File(_) | Descriptor::Socket(_) => types::Event {
                             userdata: sub.userdata,
                             error: types::Errno::Success,
                             type_: types::Eventtype::FdWrite,
@@ -2573,6 +2683,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
             pollables: Vec<Resource<crate::p2::bindings::io::streams::Pollable>>,
             inputs: Vec<Resource<crate::p2::bindings::io::streams::InputStream>>,
             outputs: Vec<Resource<crate::p2::bindings::io::streams::OutputStream>>,
+            sockets: Vec<Resource<socket::SocketReady>>,
         }
 
         impl Drop for TempResources<'_> {
@@ -2587,6 +2698,9 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                 }
                 for p in self.outputs.drain(..) {
                     assert!(p.owned());
+                    self.ctx.table.delete(p).unwrap();
+                }
+                for p in self.sockets.drain(..) {
                     self.ctx.table.delete(p).unwrap();
                 }
             }
@@ -2639,41 +2753,66 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
     }
 
     #[instrument(skip(self, _memory))]
-    fn sock_accept(
+    async fn sock_accept(
         &mut self,
         _memory: &mut GuestMemory<'_>,
         fd: types::Fd,
         flags: types::Fdflags,
     ) -> Result<types::Fd, types::Error> {
-        tracing::warn!("p1 sock_accept is not implemented");
-        self.transact()?.get_descriptor(fd)?;
-        Err(types::Errno::Notsock.into())
+        let sock = match self.transact()?.get_descriptor(fd)? {
+            Descriptor::Socket(s) if s.is_listener() => s.clone(),
+            Descriptor::Socket(_) => return Err(types::Errno::Inval.into()),
+            _ => return Err(types::Errno::Notsock.into()),
+        };
+        let stream = sock.accept().await.map_err(socket::errno)?;
+        let nonblocking = flags.contains(types::Fdflags::NONBLOCK);
+        let conn = socket::Socket::new(socket::SockKind::Stream(stream), nonblocking)
+            .map_err(socket::errno)?;
+        let mut t = self.transact()?;
+        let fd = t.descriptors.push(Descriptor::Socket(conn))?;
+        Ok(types::Fd::from(fd))
     }
 
-    #[instrument(skip(self, _memory))]
-    fn sock_recv(
+    #[instrument(skip(self, memory))]
+    async fn sock_recv(
         &mut self,
-        _memory: &mut GuestMemory<'_>,
+        memory: &mut GuestMemory<'_>,
         fd: types::Fd,
         ri_data: types::IovecArray,
         ri_flags: types::Riflags,
     ) -> Result<(types::Size, types::Roflags), types::Error> {
-        tracing::warn!("p1 sock_recv is not implemented");
-        self.transact()?.get_descriptor(fd)?;
-        Err(types::Errno::Notsock.into())
+        if !ri_flags.is_empty() {
+            // TODO(wasmdev): RECV_PEEK / RECV_WAITALL
+            return Err(types::Errno::Notsup.into());
+        }
+        let sock = match self.transact()?.get_descriptor(fd)? {
+            Descriptor::Socket(s) => s.clone(),
+            _ => return Err(types::Errno::Notsock.into()),
+        };
+        let iov = self.first_non_empty_iovec(memory, ri_data)?;
+        let mut buf = vec![0; iov.len() as usize];
+        let n = sock.read(&mut buf).await.map_err(socket::errno)?;
+        let iov = iov.get_range(0..u32::try_from(n)?).unwrap();
+        memory.copy_from_slice(&buf[..n], iov)?;
+        Ok((n.try_into()?, types::Roflags::empty()))
     }
 
-    #[instrument(skip(self, _memory))]
-    fn sock_send(
+    #[instrument(skip(self, memory))]
+    async fn sock_send(
         &mut self,
-        _memory: &mut GuestMemory<'_>,
+        memory: &mut GuestMemory<'_>,
         fd: types::Fd,
         si_data: types::CiovecArray,
         _si_flags: types::Siflags,
     ) -> Result<types::Size, types::Error> {
-        tracing::warn!("p1 sock_send is not implemented");
-        self.transact()?.get_descriptor(fd)?;
-        Err(types::Errno::Notsock.into())
+        let sock = match self.transact()?.get_descriptor(fd)? {
+            Descriptor::Socket(s) => s.clone(),
+            _ => return Err(types::Errno::Notsock.into()),
+        };
+        let buf = self.first_non_empty_ciovec(memory, si_data)?;
+        let bytes = memory.to_vec(buf)?;
+        let n = sock.write(&bytes).await.map_err(socket::errno)?;
+        Ok(n.try_into()?)
     }
 
     #[instrument(skip(self, _memory))]
@@ -2683,9 +2822,17 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
         fd: types::Fd,
         how: types::Sdflags,
     ) -> Result<(), types::Error> {
-        tracing::warn!("p1 sock_shutdown is not implemented");
-        self.transact()?.get_descriptor(fd)?;
-        Err(types::Errno::Notsock.into())
+        let sock = match self.transact()?.get_descriptor(fd)? {
+            Descriptor::Socket(s) => s.clone(),
+            _ => return Err(types::Errno::Notsock.into()),
+        };
+        let how = match (how.contains(types::Sdflags::RD), how.contains(types::Sdflags::WR)) {
+            (true, true) => std::net::Shutdown::Both,
+            (true, false) => std::net::Shutdown::Read,
+            (false, true) => std::net::Shutdown::Write,
+            (false, false) => return Err(types::Errno::Inval.into()),
+        };
+        sock.shutdown(how).map_err(socket::errno)
     }
 }
 
