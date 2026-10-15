@@ -20,3 +20,14 @@
 - wasip1 `--tcplisten` gone in wasmtime 49 → network services should target wasip2 (C TCP server via wasi-sdk-34 wasip2 libc + wasm-tools component link worked, all in wasm).
 - rustc-as-wasm: exists only as old 1.83 nightly forks needing wasi-threads; deferred.
 - CPython 3.15 WASI works incl. unittest (no sqlite3). Candidate third language.
+
+## E3 result — host + control plane skeleton (see notes/e3-host.md) — independently re-run by coordinator: demo passes
+- Rust host (wasmtime 49) + Go wasip1 control plane serving net/http on host-preopened socket. Trivial run p50 ~3 ms over HTTP; service start-to-ready ~3 ms warm.
+- wasmtime-wasi 49 p1 has no socket support → vendored + ~360-line patch adding preopened TCP listeners. 
+- Module cache: 53 MB cmd/compile cold compile 117 s/1.26 GB; disk cache 212 ms; memory 0.01 ms.
+
+## DECISION D1 (expensive to reverse): control plane = Go/wasip1 on patched wasmtime-wasi p1 sockets
+- Why: Go toolchain runs as wasm → control plane can be built/tested by the service itself (criterion 7); stock net/http works.
+- Cost: carrying a wasmtime-wasi patch. Exit: if Go gains wasip2, or move ingress to wasi:http.
+- User workloads: wasip1 (Go, C, Python) AND wasip2 components (C servers via wasi:sockets) — both supported.
+- Services exposed on host ports 8100-8199; reachable privately via exe.dev proxy https://altwasm.exe.xyz:PORT (exe.dev auth), no extra proxy layer for now.
