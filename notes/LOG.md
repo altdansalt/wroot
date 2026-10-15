@@ -50,3 +50,18 @@
 - Warm builds: small C 0.3–0.5 s, wasip2 server 0.4 s, C++ (STL+EH) 9 s at -O0 / ~30 s at -O2 (same as wasmtime CLI on this noisy VM).
 - Host runs wasip2 components (auto-detected); component services may only bind their assigned $PORT; no outbound/UDP/DNS. C HTTP server built by wasm clang serves via the services API.
 - Input for D2/E5: the E4 driver is the -### approach; it works today without rebuilding clang. YoWASP llvm.wasm cannot use a spawn import as shipped (its driver calls posix_spawn, stubbed in wasi-libc), so E5 needs a rebuilt clang (or wasi-libc posix_spawn → import shim) to replace it. Suggest E5 route spawn requests guest → host → control plane (policy in wasm), reusing E4's multi-step job runner (control/exec.go runCtx.step).
+
+## E4 result — clang in the service (see notes/e4-clang-service.md) — coordinator re-ran demo-e4 warm: passes
+- cc driver lives in control plane (clang -### → jobs as separate wasm execs). wasip2 components supported; component services may bind only their $PORT, no outbound.
+- Warm: 2-file C build 0.6 s, C unit test build+run 0.7 s, C++ STL+exceptions 24 s (slow), wasip2 C server build 1.0 s, service→first 200 ~0.3 s.
+
+## Deployment for agent trials
+- `scripts/serve.sh`: API on 0.0.0.0:8700, data ~/wasmdev-data, services 8100-8199.
+- Reached from other VMs through exe.dev proxy: https://altwasm.exe.xyz:8700 with X-Exedev-Authorization (VM token, locally signed, 7-day exp) + service bearer token. Unauthenticated → 307 to login. Tokens in ~/.config/wasmdev (0600).
+- Registering clang on the live (busy) VM: precompile 535 s. One-time, but argues for shipping precompiled artifacts / precompiling offline.
+- No Claude token for other VMs → remote agents = Codex (gpt-6.1-sol via exe.dev LLM gateway) on wasm-x2; Claude Code (sonnet-5.5) agents run locally.
+
+## Agent trials round 1 (started)
+- T1 Codex@wasm-x2: C csvstat library + unit/e2e tests.
+- T2 Codex@wasm-x2: C HTTP KV service, run as service, tested over network from wasm-x2.
+- T3 Claude Code@altwasm: interpreter in C++17 with test suite.
