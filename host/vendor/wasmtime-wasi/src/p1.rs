@@ -90,6 +90,10 @@ use wiggle::tracing::instrument;
 // wasmdev patch: p1 socket support (see p1_socket.rs)
 #[path = "p1_socket.rs"]
 mod socket;
+// wasmdev patch: process-spawn support (see p1_proc.rs)
+#[path = "p1_proc.rs"]
+mod proc_fds;
+pub use proc_fds::HostFd;
 use wiggle::{GuestError, GuestMemory, GuestPtr, GuestType};
 
 // Bring all WASI traits in scope that this implementation builds on.

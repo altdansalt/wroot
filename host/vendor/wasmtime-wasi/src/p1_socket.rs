@@ -20,6 +20,7 @@ use super::types;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
@@ -28,6 +29,8 @@ use tokio::io::unix::AsyncFd;
 pub(super) enum SockKind {
     Listener(TcpListener),
     Stream(TcpStream),
+    /// wasmdev patch (process spawn): pipe ends and process exit fds.
+    Unix(UnixStream),
 }
 
 impl AsRawFd for SockKind {
@@ -35,6 +38,7 @@ impl AsRawFd for SockKind {
         match self {
             SockKind::Listener(l) => l.as_raw_fd(),
             SockKind::Stream(s) => s.as_raw_fd(),
+            SockKind::Unix(s) => s.as_raw_fd(),
         }
     }
 }
@@ -57,6 +61,7 @@ impl Socket {
                 // to small request/response exchanges.
                 s.set_nodelay(true)?;
             }
+            SockKind::Unix(s) => s.set_nonblocking(true)?,
         }
         #[allow(deprecated)]
         let inner = crate::runtime::with_ambient_tokio_runtime(|| AsyncFd::new(kind))?;
@@ -90,7 +95,7 @@ impl Socket {
     pub(super) async fn accept(&self) -> io::Result<TcpStream> {
         self.io(Interest::READABLE, |k| match k {
             SockKind::Listener(l) => l.accept().map(|(s, _)| s),
-            SockKind::Stream(_) => Err(io::Error::from_raw_os_error(libc_einval())),
+            _ => Err(io::Error::from_raw_os_error(libc_einval())),
         })
         .await
     }
@@ -99,6 +104,10 @@ impl Socket {
         self.io(Interest::READABLE, |k| match k {
             SockKind::Stream(s) => {
                 let mut s: &TcpStream = s;
+                s.read(buf)
+            }
+            SockKind::Unix(s) => {
+                let mut s: &UnixStream = s;
                 s.read(buf)
             }
             SockKind::Listener(_) => Err(io::Error::from(io::ErrorKind::NotConnected)),
@@ -112,6 +121,10 @@ impl Socket {
                 let mut s: &TcpStream = s;
                 s.write(buf)
             }
+            SockKind::Unix(s) => {
+                let mut s: &UnixStream = s;
+                s.write(buf)
+            }
             SockKind::Listener(_) => Err(io::Error::from(io::ErrorKind::NotConnected)),
         })
         .await
@@ -120,6 +133,7 @@ impl Socket {
     pub(super) fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         match self.inner.get_ref() {
             SockKind::Stream(s) => s.shutdown(how),
+            SockKind::Unix(s) => s.shutdown(how),
             SockKind::Listener(_) => Err(io::Error::from(io::ErrorKind::NotConnected)),
         }
     }
