@@ -59,7 +59,7 @@ t0=$(now_ms)
 host/target/release/wasmdev-host --control "$BUILD/control.wasm" --listen "127.0.0.1:$PORT" \
   --data "$DATA" --token "$TOKEN" --service-ports 8100-8199 >>"$DATA.log" 2>&1 &
 HOST_PID=$!
-trap '[[ -z "${KEEP:-}" ]] && { kill $HOST_PID 2>/dev/null; wait $HOST_PID 2>/dev/null; }; rm -rf "$OUT"' EXIT
+trap '[[ -z "${KEEP:-}" ]] && { kill $HOST_PID 2>/dev/null; wait $HOST_PID 2>/dev/null || true; }; rm -rf "$OUT"' EXIT
 until curl -sf "$API/healthz" >/dev/null 2>&1; do
   kill -0 $HOST_PID 2>/dev/null || { tail "$DATA.log"; die "host exited"; }
   sleep 0.05
