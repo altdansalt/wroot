@@ -19,11 +19,12 @@ This file lists every capability the host grants to wasm, and why.
 | stdout / stderr | inherited from the host process | Logging. stdin is empty. |
 | `/data` (read-write) | preopened dir, fd 3 | All persistent state: workspaces (`/data/ws`), run outputs (`/data/runs`), tool registry (`/data/tools`), agent tokens (`/data/tokens.json`). |
 | One listening TCP socket | bound by the host to `--listen`, preopened as fd 4 (`$WASMDEV_LISTEN_FD`), starts NONBLOCK | Serving the HTTP API. The control plane cannot open other sockets (no `sock_open` in p1, and p2 sockets are not linked). |
-| Env: `WASMDEV_TOKEN`, `WASMDEV_PUBLIC_HOST`, `WASMDEV_LISTEN_FD`, other `WASMDEV_*` from host env | `WasiCtxBuilder::env` | Admin bearer token; hostname to put in service URLs; listener fd. |
+| Env: `WASMDEV_TOKEN`, `WASMDEV_PUBLIC_HOST`, `WASMDEV_LISTEN_FD`, `WASMDEV_HOST_CPUS`, `WASMDEV_DEFAULT_WASM_STACK`, other `WASMDEV_*` from host env | `WasiCtxBuilder::env` | Admin bearer token; hostname to put in service URLs; listener fd; host facts wasm cannot learn (wasip1's `runtime.NumCPU()` is always 1; the control plane uses the core count for `go -p`). `WASMDEV_PUBLIC_SCHEME` (default `https`) and `WASMDEV_USER_COMPILER` are control-plane settings passed through. |
 | `wasmdev.exec_start(spec_ptr, spec_len) -> i64` | host import | Start a workload. Spec is JSON (below). Never blocks: validation and port binding happen inline, compilation and execution on a new OS thread. Errors surface as status `failed`. |
 | `wasmdev.exec_status(handle, buf_ptr, buf_cap) -> i32` | host import | Non-blocking status as JSON. Returns the JSON length; if it is > `buf_cap` nothing was written and the caller retries with a bigger buffer. `-1` = unknown handle. |
 | `wasmdev.exec_kill(handle) -> i32` | host import | Request termination (asynchronous; observe via status). |
 | `wasmdev.exec_release(handle) -> i32` | host import | Kill if running and forget the job record (frees memory). |
+| `wasmdev.exec_ready(handle) -> i32` | host import | Service readiness: `1` = accepting connections, `0` = not yet, `-1` = unknown / not a service. wasip1: the guest has called `sock_accept` on its listener (the host bound the port before the guest started, so a TCP connect would succeed too early). wasip2: a TCP connect to the service's port succeeds (the guest binds it itself). The control plane polls it for `wait_ready`. |
 
 The control plane is CPU-preempted at every epoch tick (5 ms) by yielding
 to the host executor; it has no memory limit (it is trusted code).
@@ -42,9 +43,19 @@ to the host executor; it has no memory limit (it is trusted code).
   "timeout_ms": 60000,                     // 0 = none
   "memory_limit_mb": 512,                  // 0 = host default (--memory-mb)
   "listen": false,                         // true = service, see below
-  "precompile_only": false                 // true = only compile into the cache
+  "precompile_only": false,                // true = only compile into the cache
+  "max_wasm_stack": 0,                     // wasm call-stack bytes; 0 = 8 MiB default, max 256 MiB
+  "compiler": "cranelift",                 // or "winch"
+  "tier_up": false,                        // winch + tier_up: see "Compilers"
+  "ephemeral": false,                      // true = compiled code kept in memory only
+  "spawn": false                           // grant wasmdev_proc (process spawn)
 }
 ```
+
+Mounts may carry `"compiler": "winch"`: modules a spawning workload starts
+*from that mount* are compiled with Winch and kept in memory only (used for
+the Go tool's scratch dir, where `go test` writes the test binaries it runs
+once).
 
 `precompile_only` compiles the module (or loads it from the disk cache)
 into the in-memory cache and finishes with state `exited` without
@@ -69,6 +80,12 @@ since workloads can create symlinks in their workspaces.
 `state`: `starting | running | exited | failed | killed | timeout`.
 `cache`: how the compiled module was obtained (`memory | disk | compiled`).
 `kind`: `module` (wasip1 core module) or `component` (wasip2).
+`trap` (state `failed` only, when the failure is a wasm trap): wasmtime's
+trap code in snake_case — `stack_overflow`, `memory_out_of_bounds`,
+`unreachable`, `integer_division_by_zero`, ... The host only classifies;
+the control plane turns it into advice (e.g. an out-of-bounds fault just
+below 4 GiB is a C linear-stack overflow).
+`compiler`: `cranelift | winch`, the code actually run.
 
 ## To workloads
 
@@ -82,10 +99,11 @@ since workloads can create symlinks in their workspaces.
 | Listening TCP socket, wasip1 service | host binds `--service-bind` on a free port in `--service-ports` (default `0.0.0.0`, 8100–8199); preopened at fd `3 + len(dirs)`; `$WASMDEV_LISTEN_FD` | Long-running servers. Only `accept` on that listener — no `sock_open`, no outbound. Port is released when the workload exits. |
 | `wasi:sockets` TCP, wasip2 service | host reserves a free port (bind, held until the guest starts, then released), passes it as `$PORT` / `$WASMDEV_PORT`, and installs a `socket_addr_check` | The guest binds/listens itself. **Allowed:** `TcpBind`/`TcpListen` on exactly the assigned port, on an address no wider than `--service-bind` (any address if that is `0.0.0.0`; else that address or loopback); `TcpAccept` from anyone. **Denied:** `TcpConnect` (all outbound, including loopback, other services and the control plane), UDP (`allow_udp(false)`), DNS (`allow_ip_name_lookup(false)`). Small race: between releasing the reservation and the guest's bind another process could take the port; then the guest's `bind` fails and the service exits. |
 | No sockets, plain runs | components that are not services get `allow_tcp(false)` too | Builds and tests are offline. |
+| wasm call stack | `max_wasm_stack` from the spec (default 8 MiB, wasmtime's own default is 512 KiB; max 256 MiB); async fiber stack = that + 2 MiB | Interpreters and deeply recursive programs hit 512 KiB quickly (agent trial T3). wasmtime's limit is engine-wide, so each distinct size gets its own engine (see Compilers). Children inherit it. |
 | CPU time | epoch interruption every 5 ms → yield to executor; `timeout_ms` enforced by trap/cancellation | Never blocks other work; hard timeouts even when the guest is blocked in a host call (the future is dropped). |
 | Memory | `StoreLimits` (`memory_limit_mb`, default `--memory-mb`); max 4 instances per module, 64 per component (wit-component shims) | Bound per-workload memory. |
 | Wasm features | wasmtime defaults + exceptions (`gc`/`gc-drc` cargo features) | C++ built with `-fwasm-exceptions` (exnref encoding) needs the exception-handling proposal; legacy EH is not supported by wasmtime 49. |
-| Child processes (wasip1 core modules only) | `wasmdev_proc.*` imports, see [Process spawn](#process-spawn-wasmdev_proc) | Unmodified tool drivers (`cmd/go`, later clang's driver) orchestrate their own sub-tools (compile, asm, link, vet, test binaries) as further wasm processes. The children are wasm modules found through the caller's own preopens and get no more authority than the caller. |
+| Child processes (wasip1 core modules only, when the spec has `"spawn": true`; children inherit it) | `wasmdev_proc.*` imports, see [Process spawn](#process-spawn-wasmdev_proc) | Unmodified tool drivers (`cmd/go`, later clang's driver) orchestrate their own sub-tools (compile, asm, link, vet, test binaries) as further wasm processes. The children are wasm modules found through the caller's own preopens and get no more authority than the caller. |
 
 **Outbound network decision.** Workloads get no outbound network: not
 for builds (reproducibility, no exfiltration of workspace contents, no
@@ -113,7 +131,11 @@ asks for. Process spawn is the only way to get concurrency for single-threaded
 wasip1 tools too: children run on their own host threads, so `go build -p 2`
 really compiles two packages at once.
 
-Every wasip1 workload (and its children, recursively) gets this import module.
+Every wasip1 workload started with `"spawn": true` (and its children,
+recursively) gets this import module; the control plane sets it only for
+tools whose manifest says `"spawn": true` (the Go toolchain). User
+programs don't get it: the imports exist (so any module links), but
+without the grant `spawn` fails with `ENOEXEC`.
 All functions return a WASI errno (0 = success); none of them blocks the
 caller except `wait` with `nohang = 0`.
 
@@ -140,8 +162,9 @@ Resolution and isolation:
   timeout): no orphans. Limits: 64 live children per process, depth 8.
 - Children use the shared compiled-module cache (memory, then disk), so a
   53 MB `compile` spawn costs ~0.2 s from disk once per host process and
-  ~0 afterwards; a first-ever module (e.g. a new test binary) is compiled by
-  Cranelift on spawn.
+  ~0 afterwards. A first-ever module from a mount marked
+  `"compiler": "winch"` (a new test binary) is compiled by Winch, in memory only.
+- Children run with the parent's `max_wasm_stack`.
 - wasip2 components can in principle be spawned as children (untested) but do not get
   `wasmdev_proc` themselves.
 
@@ -156,13 +179,36 @@ guest *builds* are compiled against pristine std and do not import
 Test harness without the control plane:
 
 ```
-wasmdev-host exec [--dir HOST[::GUEST][:ro]]... [--env K=V]... [--cwd GUEST] \
-                  [--cache DIR] [--memory-mb N] -- module.wasm [args...]
+wasmdev-host exec [--dir HOST[::GUEST][:ro][:winch]]... [--env K=V]... [--cwd GUEST] \
+                  [--cache DIR] [--memory-mb N] [--max-wasm-stack BYTES] [--winch] \
+                  -- module.wasm [args...]
 ```
 
 stdio inherited, exit code propagated, `WASMDEV_TRACE_PROC=1` logs one line per
 process (wall time, module load time, cache hit kind). See
 `experiments/e5-spawn/run-go.sh`.
+
+## Compilers and engines
+
+wasmtime fixes both the compiler and `max_wasm_stack` per `Engine`, so the
+host keeps one engine (plus its p1/p2 linkers) per (compiler, stack size)
+pair, created on first use (`host/src/rt.rs`). The default engine
+(Cranelift, 8 MiB) also runs the control plane. Cranelift engines that
+differ only in stack size share the disk cache (the stack limit is a
+runtime setting, not part of the compiled code); in memory, compiled code
+is engine-bound.
+
+- **Cranelift** (optimizing): tools (registered toolchains), the control plane.
+- **Winch** (baseline, x86-64): ~5x faster to compile, code ~2x slower
+  (measured in notes/w1.md). Used for modules that are typically run once:
+  Go test binaries (via the scratch mount's `compiler`), and as the first
+  tier for workspace programs. Winch rejects some features (it falls back
+  to Cranelift automatically if a module doesn't compile).
+- **Tier-up** (`"compiler": "winch", "tier_up": true`): if Cranelift code
+  for the module is already in memory it is used; otherwise the module runs
+  with Winch code and, after that compile, a background thread compiles it
+  with Cranelift (one background compile at a time) for the next run. The
+  control plane uses this for workspace programs and services.
 
 ## Module cache
 
@@ -172,8 +218,14 @@ the wasm bytes, memoized on path+size+mtime) and on disk in `<data>.cache/`
 loaded via `Module::deserialize_file`). The cache dir is a sibling of the
 data dir so no guest can plant a `.cwasm` (deserializing is `unsafe`:
 it trusts the file as native code). Disk hits are deserialized without
-taking the compile lock (so they never wait behind a multi-minute
-compile); misses compile one at a time. After each compile the host calls
+taking a compile lock (so they never wait behind a multi-minute
+compile); misses compile one at a time per size class: modules >= 16 MB
+(toolchains) share one lock, smaller ones (user programs, test binaries)
+another, so a user program never queues behind a 3-minute toolchain
+compile (observed: 70-87 s waits before this split). `ephemeral` modules
+(workspace programs, Winch-compiled test binaries) are kept in memory
+only, at most 32, oldest evicted first — they change on every build and
+would otherwise fill the disk cache. After each compile the host calls
 `malloc_trim(0)`: Cranelift's parallel compile otherwise leaves ~1.9 GB
 of freed glibc arena memory resident after compiling clang.
 
@@ -181,7 +233,8 @@ of freed glibc arena memory resident after compiling clang.
 |---|---|---|---|---|
 | clang/lld (llvm.wasm) | 75 MB | 227–254 s, ~1.9 GB peak | 219 MB | 0.6–1.2 s |
 | wasm-tools.wasm | 16 MB | 42 s | 43 MB | 0.2–0.6 s |
-| control.wasm | 12 MB | 22–27 s | 26 MB | 0.1–0.4 s |
+| control.wasm | 12 MB | 22–31 s | 26 MB | 0.1–0.4 s |
+| Go toolchain: go, gofmt, compile, link, asm, vet, buildid, cover, test2json, pack | 196 MB total (compile 53 MB) | 318 s for all 10 | — | ~0.1–0.3 s each |
 
 ## The wasip1 socket patch
 
