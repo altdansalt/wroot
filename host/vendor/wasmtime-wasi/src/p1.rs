@@ -153,6 +153,8 @@ pub struct WasiP1Ctx {
     hostcall_fuel: usize,
     /// wasmdev patch: listeners to expose after the preopened directories.
     preopen_listeners: Vec<std::net::TcpListener>,
+    /// wasmdev patch: set once the guest calls `sock_accept` (it is serving).
+    accept_called: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WasiP1Ctx {
@@ -163,6 +165,7 @@ impl WasiP1Ctx {
             adapter: WasiP1Adapter::new(),
             hostcall_fuel: 0,
             preopen_listeners: Vec::new(),
+            accept_called: Default::default(),
         }
     }
 
@@ -179,6 +182,13 @@ impl WasiP1Ctx {
             "preopen_tcp_listener must be called before the guest runs"
         );
         self.preopen_listeners.push(listener);
+    }
+
+    /// wasmdev patch: flag that becomes true when the guest first calls
+    /// `sock_accept` on a listener, i.e. the service is accepting
+    /// connections (used for service readiness).
+    pub fn accept_called_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.accept_called.clone()
     }
 
     fn consume_fuel(&mut self, fuel: usize) -> Result<()> {
@@ -2772,6 +2782,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
             Descriptor::Socket(_) => return Err(types::Errno::Inval.into()),
             _ => return Err(types::Errno::Notsock.into()),
         };
+        self.accept_called.store(true, std::sync::atomic::Ordering::Relaxed);
         let stream = sock.accept().await.map_err(socket::errno)?;
         let nonblocking = flags.contains(types::Fdflags::NONBLOCK);
         let conn = socket::Socket::new(socket::SockKind::Stream(stream), nonblocking)
