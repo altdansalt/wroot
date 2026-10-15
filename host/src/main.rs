@@ -10,14 +10,15 @@ mod cache;
 mod cli_exec;
 mod exec;
 mod proc;
+mod rt;
 
 use anyhow::{Context, Result, bail};
-use exec::{EPOCH_TICK, Exec, GUEST_DATA};
+use exec::{Exec, GUEST_DATA};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use wasmtime::{Caller, Config, Engine, Extern, Linker, Store};
+use wasmtime::{Caller, Extern, Linker, Store};
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::{FsPerms, I32Exit, WasiCtxBuilder};
 
@@ -145,6 +146,16 @@ fn add_wasmdev_imports(linker: &mut Linker<ControlState>) -> Result<()> {
     })?;
     // exec_release(handle) -> 0, or -1 if unknown. Kills if still running
     // and forgets the job record.
+    // exec_ready(handle) -> 1 if the service is accepting connections, 0 if
+    // not yet, -1 if unknown handle / not a service. wasip1: the guest has
+    // called accept on its listener; wasip2: a TCP connect to its port works.
+    linker.func_wrap("wasmdev", "exec_ready", |c: Caller<'_, ControlState>, h: i64| {
+        Ok(match c.data().exec.ready(h) {
+            Some(true) => 1i32,
+            Some(false) => 0,
+            None => -1,
+        })
+    })?;
     linker.func_wrap("wasmdev", "exec_release", |c: Caller<'_, ControlState>, h: i64| {
         Ok(if c.data().exec.release(h) { 0i32 } else { -1 })
     })?;
@@ -159,20 +170,12 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.data)?;
     let data_dir = args.data.canonicalize()?;
 
-    let mut cfg = Config::new();
-    cfg.epoch_interruption(true);
-    // C++ built with -fwasm-exceptions (exnref) needs these; both are
-    // wasmtime defaults when the gc feature is compiled in.
-    cfg.wasm_exceptions(true);
-    cfg.wasm_component_model(true);
-    let engine = Engine::new(&cfg)?;
-    {
-        let engine = engine.clone();
-        std::thread::Builder::new().name("epoch".into()).spawn(move || loop {
-            std::thread::sleep(EPOCH_TICK);
-            engine.increment_epoch();
-        })?;
-    }
+    // Engines per (compiler, wasm stack limit); see rt.rs. The default one
+    // (Cranelift, 8 MiB stack) also runs the control plane.
+    let rts = rt::Runtimes::new()?;
+    rts.start_epoch_thread()?;
+    let default_rt = rts.default_rt();
+    let engine = default_rt.engine.clone();
 
     // Compiled-module cache lives next to (not inside) the data dir so no
     // guest can write a .cwasm that we would later deserialize.
@@ -180,9 +183,9 @@ fn main() -> Result<()> {
         "{}.cache",
         data_dir.file_name().unwrap().to_string_lossy()
     ));
-    let cache = cache::ModuleCache::new(&engine, cache_dir)?;
+    let cache = cache::ModuleCache::new(cache_dir)?;
     let exec = Exec::new(
-        engine.clone(),
+        rts.clone(),
         cache,
         exec::Config {
             data_dir: data_dir.clone(),
@@ -213,6 +216,10 @@ fn main() -> Result<()> {
     }
     b.env("WASMDEV_TOKEN", &token);
     b.env("WASMDEV_PUBLIC_HOST", &args.public_host);
+    // Host facts the control plane can't learn from WASI (wasip1 reports 1 CPU).
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    b.env("WASMDEV_HOST_CPUS", cpus.to_string());
+    b.env("WASMDEV_DEFAULT_WASM_STACK", rt::DEFAULT_STACK.to_string());
     // Preopened dirs come first (fd 3..), then the listener; see
     // WasiP1Ctx::preopen_tcp_listener for why.
     b.env("WASMDEV_LISTEN_FD", "4");
@@ -225,7 +232,7 @@ fn main() -> Result<()> {
     add_wasmdev_imports(&mut linker)?;
 
     let t0 = Instant::now();
-    let loaded = exec.cache.load(&args.control)?;
+    let loaded = exec.cache.load(&default_rt, &args.control, true)?;
     let cache::Compiled::Module(control_module) = &loaded.module else {
         bail!("the control plane must be a wasip1 core module, not a component");
     };

@@ -25,7 +25,8 @@
 //!
 //! All functions return a WASI errno (0 = success).
 
-use crate::exec::{Exec, Job, Prepared, WorkloadState};
+use crate::exec::{Exec, HostMount, Job, Prepared, WorkloadState};
+use crate::rt::Compiler;
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
 use std::os::fd::OwnedFd;
@@ -128,41 +129,44 @@ impl Stdio {
 /// Per-workload process state (stored in the workload's `Store`).
 pub struct ProcCtx {
     pub exec: Arc<Exec>,
-    /// The workload's preopens: (host dir, guest path, readonly).
-    pub mounts: Vec<(PathBuf, String, bool)>,
+    /// The workload's preopens.
+    pub mounts: Vec<HostMount>,
     /// What this workload's own stdin/stdout/stderr are, so a child can be
     /// given "fd 1" of its parent.
     pub stdio: [Stdio; 3],
     pub memory_bytes: usize,
+    /// wasm call-stack limit, inherited by children.
+    pub stack: usize,
     pub depth: u32,
     children: HashMap<i32, Arc<Job>>,
 }
 
 impl ProcCtx {
-    pub fn new(exec: Arc<Exec>, mounts: Vec<(PathBuf, String, bool)>, stdio: [Stdio; 3], memory_bytes: usize, depth: u32) -> Self {
-        ProcCtx { exec, mounts, stdio, memory_bytes, depth, children: HashMap::new() }
+    pub fn new(exec: Arc<Exec>, mounts: Vec<HostMount>, stdio: [Stdio; 3], memory_bytes: usize, stack: usize, depth: u32) -> Self {
+        ProcCtx { exec, mounts, stdio, memory_bytes, stack, depth, children: HashMap::new() }
     }
 
     /// Resolve an absolute guest path through the preopens to a host path
     /// (symlinks resolved; must stay inside the mount it was found in).
-    fn resolve(&self, guest: &str) -> Result<PathBuf, i32> {
+    /// Also returns the mount's compiler override.
+    fn resolve(&self, guest: &str) -> Result<(PathBuf, Option<Compiler>), i32> {
         let norm = normalize(guest).ok_or(ENOENT)?;
-        let mut best: Option<(&PathBuf, PathBuf, usize)> = None;
-        for (host, g, _) in &self.mounts {
-            let Some(gn) = normalize(g) else { continue };
+        let mut best: Option<(&HostMount, PathBuf, usize)> = None;
+        for m in &self.mounts {
+            let Some(gn) = normalize(&m.guest) else { continue };
             if let Ok(rest) = norm.strip_prefix(&gn) {
                 let depth = gn.components().count();
                 if best.as_ref().is_none_or(|b| depth > b.2) {
-                    best = Some((host, rest.to_path_buf(), depth));
+                    best = Some((m, rest.to_path_buf(), depth));
                 }
             }
         }
-        let (host, rest, _) = best.ok_or(ENOENT)?;
-        let p = host.join(rest).canonicalize().map_err(|_| ENOENT)?;
-        if !p.starts_with(host) {
+        let (m, rest, _) = best.ok_or(ENOENT)?;
+        let p = m.host.join(rest).canonicalize().map_err(|_| ENOENT)?;
+        if !p.starts_with(&m.host) {
             return Err(EACCES);
         }
-        Ok(p)
+        Ok((p, m.compiler))
     }
 }
 
@@ -347,7 +351,7 @@ fn spawn(st: &mut WorkloadState, path: &str, argv: &[u8], env: &[u8], dir: &str,
     if proc.depth >= MAX_DEPTH || proc.children.len() >= MAX_CHILDREN {
         return Err(EAGAIN);
     }
-    let module = proc.resolve(path)?;
+    let (module, compiler) = proc.resolve(path)?;
     if !module.is_file() {
         return Err(EACCES);
     }
@@ -363,7 +367,7 @@ fn spawn(st: &mut WorkloadState, path: &str, argv: &[u8], env: &[u8], dir: &str,
         }
     }
     if !dir.is_empty() {
-        let d = proc.resolve(dir)?;
+        let (d, _) = proc.resolve(dir)?;
         if !d.is_dir() {
             return Err(ENOENT);
         }
@@ -389,9 +393,16 @@ fn spawn(st: &mut WorkloadState, path: &str, argv: &[u8], env: &[u8], dir: &str,
     let _ = exit_guest.shutdown(std::net::Shutdown::Write);
     let exitfd = st.wasi.wasmdev_push_unix(exit_guest).map_err(|_| EMFILE)?;
     let proc = st.proc.as_mut().unwrap();
+    // A mount with a compiler override (a build tool's temp dir) holds
+    // freshly built, run-once modules: compile fast, keep in memory only.
+    let rt = proc.exec.rts.get(compiler.unwrap_or_default(), proc.stack).map_err(|_| EIO)?;
     let p = Prepared {
         module: module.clone(),
         component,
+        rt,
+        persist: compiler.is_none(),
+        spawn: true,
+        tier_up: false,
         precompile_only: false,
         args,
         env: envm,

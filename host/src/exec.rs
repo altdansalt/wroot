@@ -7,6 +7,7 @@
 
 use crate::cache::{CacheResult, Compiled, ModuleCache, is_component_file};
 use crate::proc::Stdio;
+use crate::rt::{Compiler, Rt, Runtimes};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -16,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wasmtime::component::ResourceTable;
-use wasmtime::{Engine, Linker, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
+use wasmtime::{Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::sockets::SocketAddrUse;
 use wasmtime_wasi::{FsPerms, I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -52,6 +53,21 @@ pub struct ExecSpec {
     /// Only compile the module into the cache (no instantiation); used to
     /// warm toolchains when they are registered.
     pub precompile_only: bool,
+    /// wasm call-stack limit in bytes (wasmtime `max_wasm_stack`); 0 = host
+    /// default (8 MiB). Child processes inherit it.
+    pub max_wasm_stack: u64,
+    /// Compiler for the module: "cranelift" (default) or "winch".
+    pub compiler: Option<Compiler>,
+    /// Don't write the compiled module to the disk cache (memory only,
+    /// evicted after a few newer ones). For short-lived builds.
+    pub ephemeral: bool,
+    /// Grant the `wasmdev_proc` process-spawn imports (inherited by
+    /// children). Off: spawn fails with ENOEXEC.
+    pub spawn: bool,
+    /// With compiler "winch": use Cranelift code if it is already in memory;
+    /// otherwise run the Winch code and compile Cranelift in the background
+    /// for the next run (tier-up).
+    pub tier_up: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -60,6 +76,20 @@ pub struct Mount {
     pub guest: String,
     #[serde(default)]
     pub readonly: bool,
+    /// Modules spawned from this mount are compiled with this compiler and
+    /// kept in memory only (e.g. "winch" for a build tool's temp dir, where
+    /// `go test` puts the test binaries it runs once).
+    #[serde(default)]
+    pub compiler: Option<Compiler>,
+}
+
+/// A workload's preopened directory.
+#[derive(Clone, Debug)]
+pub struct HostMount {
+    pub host: PathBuf,
+    pub guest: String,
+    pub readonly: bool,
+    pub compiler: Option<Compiler>,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -77,10 +107,24 @@ pub struct Status {
     pub listen_fd: Option<u32>,
     /// "module" (wasip1 core module) or "component" (wasip2).
     pub kind: Option<&'static str>,
+    /// For state "failed" by a wasm trap: stack_overflow,
+    /// memory_out_of_bounds, unreachable, integer_division_by_zero, ...
+    pub trap: Option<String>,
+    /// Compiler actually used ("cranelift" | "winch").
+    pub compiler: Option<Compiler>,
+}
+
+/// How to tell that a service is accepting connections.
+enum Ready {
+    /// wasip1: the guest has called `sock_accept` on its listener.
+    Accept(Arc<AtomicBool>),
+    /// wasip2: the guest binds the port itself; probe with a TCP connect.
+    Probe(SocketAddr),
 }
 
 pub struct Job {
     status: Mutex<Status>,
+    ready: Mutex<Option<Ready>>,
     started: Instant,
     kill: AtomicBool,
     kill_notify: tokio::sync::Notify,
@@ -104,11 +148,9 @@ pub struct Config {
 }
 
 pub struct Exec {
-    pub engine: Engine,
-    pub cache: ModuleCache,
+    pub rts: Arc<Runtimes>,
+    pub cache: Arc<ModuleCache>,
     pub cfg: Config,
-    linker: Linker<WorkloadState>,
-    clinker: wasmtime::component::Linker<ComponentState>,
     jobs: Mutex<HashMap<i64, Arc<Job>>>,
     next: AtomicI64,
     ports: Mutex<BTreeSet<u16>>,
@@ -123,8 +165,8 @@ pub struct WorkloadState {
 
 /// Store state for wasip2 components.
 pub struct ComponentState {
-    ctx: WasiCtx,
-    table: ResourceTable,
+    pub(crate) ctx: WasiCtx,
+    pub(crate) table: ResourceTable,
     limits: StoreLimits,
 }
 
@@ -139,18 +181,11 @@ fn ms(d: Duration) -> f64 {
 }
 
 impl Exec {
-    pub fn new(engine: Engine, cache: ModuleCache, cfg: Config) -> Result<Arc<Self>> {
-        let mut linker = Linker::new(&engine);
-        wasmtime_wasi::p1::add_to_linker_async(&mut linker, |s: &mut WorkloadState| &mut s.wasi)?;
-        crate::proc::add_to_linker(&mut linker)?;
-        let mut clinker = wasmtime::component::Linker::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut clinker)?;
+    pub fn new(rts: Arc<Runtimes>, cache: ModuleCache, cfg: Config) -> Result<Arc<Self>> {
         Ok(Arc::new(Exec {
-            engine,
-            cache,
+            rts,
+            cache: Arc::new(cache),
             cfg,
-            linker,
-            clinker,
             jobs: Mutex::new(HashMap::new()),
             next: AtomicI64::new(1),
             ports: Mutex::new(BTreeSet::new()),
@@ -185,6 +220,17 @@ impl Exec {
 
     pub fn get(&self, h: i64) -> Option<Arc<Job>> {
         self.jobs.lock().unwrap().get(&h).cloned()
+    }
+
+    /// Is service `h` accepting connections? None = unknown handle or not
+    /// a service.
+    pub fn ready(&self, h: i64) -> Option<bool> {
+        let job = self.get(h)?;
+        let r = job.ready.lock().unwrap();
+        match r.as_ref()? {
+            Ready::Accept(flag) => Some(flag.load(Ordering::Relaxed)),
+            Ready::Probe(addr) => Some(std::net::TcpStream::connect_timeout(addr, Duration::from_millis(200)).is_ok()),
+        }
     }
 
     pub fn kill(&self, h: i64) -> bool {
@@ -229,6 +275,7 @@ impl Exec {
                 state: "starting",
                 ..Default::default()
             }),
+            ready: Mutex::new(None),
             started: Instant::now(),
             kill: AtomicBool::new(false),
             kill_notify: tokio::sync::Notify::new(),
@@ -261,6 +308,7 @@ impl Exec {
                 kind: Some(if p.component { "component" } else { "module" }),
                 ..Default::default()
             }),
+            ready: Mutex::new(None),
             started: Instant::now(),
             kill: AtomicBool::new(false),
             kill_notify: tokio::sync::Notify::new(),
@@ -299,8 +347,11 @@ impl Exec {
             if !host.is_dir() {
                 bail!("mount {}: not a directory", m.host);
             }
-            mounts.push((host, m.guest.clone(), m.readonly));
+            mounts.push(HostMount { host, guest: m.guest.clone(), readonly: m.readonly, compiler: m.compiler });
         }
+        let stack = crate::rt::normalize_stack(spec.max_wasm_stack)?;
+        let compiler = spec.compiler.unwrap_or_default();
+        let rt = self.rts.get(compiler, stack)?;
         let stdin = spec.stdin.as_deref().map(|p| self.host_path(p, true)).transpose()?;
         let stdout = spec.stdout.as_deref().map(|p| self.host_path(p, false)).transpose()?;
         let stderr = spec.stderr.as_deref().map(|p| self.host_path(p, false)).transpose()?;
@@ -320,6 +371,10 @@ impl Exec {
         Ok(Prepared {
             module,
             component,
+            rt,
+            persist: !spec.ephemeral,
+            spawn: spec.spawn,
+            tier_up: spec.tier_up,
             precompile_only: spec.precompile_only,
             args: spec.args,
             env: spec.env,
@@ -360,13 +415,16 @@ impl Exec {
         });
         // Re-check flags: an epoch-interrupt trap may have raced the select.
         let outcome = match outcome {
-            Outcome::Failed(_) if job.kill.load(Ordering::SeqCst) => Outcome::Killed,
-            Outcome::Failed(_) if timeout.is_some_and(|t| job.started.elapsed() >= t) => Outcome::Timeout,
+            Outcome::Failed(..) if job.kill.load(Ordering::SeqCst) => Outcome::Killed,
+            Outcome::Failed(..) if timeout.is_some_and(|t| job.started.elapsed() >= t) => Outcome::Timeout,
             o => o,
         };
         match outcome {
             Outcome::Exited(c) => self.finish(&job, "exited", Some(c), None),
-            Outcome::Failed(e) => self.finish(&job, "failed", None, Some(e)),
+            Outcome::Failed(e, trap) => {
+                job.status.lock().unwrap().trap = trap;
+                self.finish(&job, "failed", None, Some(e))
+            }
             Outcome::Killed => self.finish(&job, "killed", None, Some("killed".into())),
             Outcome::Timeout => self.finish(&job, "timeout", None, Some("timeout".into())),
         }
@@ -393,17 +451,48 @@ impl Exec {
     async fn run_workload(self: &Arc<Self>, job: &Arc<Job>, p: Prepared) -> Outcome {
         match self.run_inner(job, p).await {
             Ok(code) => Outcome::Exited(code),
-            Err(e) => Outcome::Failed(format!("{e:#}")),
+            Err(e) => {
+                let trap = e.downcast_ref::<wasmtime::Trap>().map(trap_name);
+                Outcome::Failed(format!("{e:#}"), trap)
+            }
         }
     }
 
     async fn run_inner(self: &Arc<Self>, job: &Arc<Job>, mut p: Prepared) -> Result<i32> {
-        let loaded = self.cache.load(&p.module)?;
+        // Winch is a first tier for fresh modules; it rejects some
+        // features (e.g. exceptions, components): fall back to Cranelift.
+        let mut bg = None;
+        let tiered = if p.tier_up && p.rt.compiler == Compiler::Winch {
+            let crt = self.rts.get(Compiler::Cranelift, p.rt.stack)?;
+            match self.cache.lookup(&crt, &p.module) {
+                Some(l) => Some((crt, l)),
+                None => {
+                    // after the (fast) Winch compile below, so they don't compete
+                    bg = Some(crt);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (rt, loaded) = match tiered.map_or_else(|| self.cache.load(&p.rt, &p.module, p.persist).map(|l| (p.rt.clone(), l)), Ok) {
+            Ok(x) => x,
+            Err(e) if p.rt.compiler == Compiler::Winch => {
+                let rt = self.rts.get(Compiler::Cranelift, p.rt.stack)?;
+                let l = self.cache.load(&rt, &p.module, p.persist).map_err(|e2| e2.context(format!("winch: {e:#}")))?;
+                (rt, l)
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(crt) = bg {
+            self.cache.compile_background(crt, p.module.clone());
+        }
         {
             let mut s = job.status.lock().unwrap();
             s.state = "running";
             s.load_ms = loaded.load_ms;
             s.cache = Some(loaded.cache);
+            s.compiler = Some(rt.compiler);
         }
         if p.precompile_only {
             return Ok(0);
@@ -416,11 +505,11 @@ impl Exec {
         for (k, v) in &p.env {
             b.env(k, v);
         }
-        for (host, guest, ro) in &p.mounts {
-            let perms = if *ro { FsPerms::ReadOnly } else { FsPerms::ReadWrite };
-            b.preopened_dir(host, guest, perms)
+        for m in &p.mounts {
+            let perms = if m.readonly { FsPerms::ReadOnly } else { FsPerms::ReadWrite };
+            b.preopened_dir(&m.host, &m.guest, perms)
                 .map_err(anyhow::Error::from)
-                .with_context(|| format!("mount {}", host.display()))?;
+                .with_context(|| format!("mount {}", m.host.display()))?;
         }
         let stdio = match p.stdio.take() {
             Some(s) => s,
@@ -450,6 +539,13 @@ impl Exec {
                 let ok = service_socket_allowed(bind_ip, port, addr, usage);
                 Box::pin(async move { ok })
             });
+            if p.component {
+                let ip = match bind_ip {
+                    Some(ip) if !ip.is_unspecified() => ip,
+                    _ => IpAddr::from([127, 0, 0, 1]),
+                };
+                *job.ready.lock().unwrap() = Some(Ready::Probe(SocketAddr::new(ip, port)));
+            }
         }
         let limits = |instances| StoreLimitsBuilder::new().memory_size(p.memory_bytes).instances(instances).build();
         match loaded.module {
@@ -460,12 +556,15 @@ impl Exec {
                 let mut wasi = b.build_p1();
                 if let Some((_, l)) = p.listener {
                     wasi.preopen_tcp_listener(l);
+                    *job.ready.lock().unwrap() = Some(Ready::Accept(wasi.accept_called_flag()));
                 }
-                let proc = crate::proc::ProcCtx::new(self.clone(), p.mounts.clone(), own_stdio, p.memory_bytes, p.depth);
-                let mut store = Store::new(&self.engine, WorkloadState { wasi, limits: limits(4), proc: Some(proc) });
+                let proc = p.spawn.then(|| {
+                    crate::proc::ProcCtx::new(self.clone(), p.mounts.clone(), own_stdio, p.memory_bytes, p.rt.stack, p.depth)
+                });
+                let mut store = Store::new(&rt.engine, WorkloadState { wasi, limits: limits(4), proc });
                 store.limiter(|s| &mut s.limits);
                 interruptible(&mut store, job);
-                let instance = self.linker.instantiate_async(&mut store, &module).await?;
+                let instance = rt.linker.instantiate_async(&mut store, &module).await?;
                 let start = instance
                     .get_typed_func::<(), ()>(&mut store, "_start")
                     .map_err(anyhow::Error::from)
@@ -476,10 +575,10 @@ impl Exec {
                 // Release the port reservation; the guest binds it itself.
                 drop(p.listener);
                 let state = ComponentState { ctx: b.build(), table: ResourceTable::new(), limits: limits(64) };
-                let mut store = Store::new(&self.engine, state);
+                let mut store = Store::new(&rt.engine, state);
                 store.limiter(|s| &mut s.limits);
                 interruptible(&mut store, job);
-                let cmd = wasmtime_wasi::p2::bindings::Command::instantiate_async(&mut store, &component, &self.clinker)
+                let cmd = wasmtime_wasi::p2::bindings::Command::instantiate_async(&mut store, &component, &rt.clinker)
                     .await
                     .map_err(anyhow::Error::from)
                     .context("instantiate component (only wasi:cli/command components are supported)")?;
@@ -531,9 +630,28 @@ fn exit_code(r: wasmtime::Result<i32>) -> Result<i32> {
     }
 }
 
+/// snake_case name of a trap code ("StackOverflow" -> "stack_overflow").
+fn trap_name(t: &wasmtime::Trap) -> String {
+    let mut out = String::new();
+    for (i, c) in format!("{t:?}").chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    match out.as_str() {
+        "unreachable_code_reached" => "unreachable".into(),
+        _ => out,
+    }
+}
+
 enum Outcome {
     Exited(i32),
-    Failed(String),
+    Failed(String, Option<String>),
     Killed,
     Timeout,
 }
@@ -541,10 +659,18 @@ enum Outcome {
 pub(crate) struct Prepared {
     pub module: PathBuf,
     pub component: bool,
+    /// Engine to compile/run with (compiler + call-stack limit).
+    pub rt: Arc<Rt>,
+    /// Write the compiled module to the disk cache.
+    pub persist: bool,
+    /// Grant `wasmdev_proc` (process spawn).
+    pub spawn: bool,
+    /// See ExecSpec::tier_up.
+    pub tier_up: bool,
     pub precompile_only: bool,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
-    pub mounts: Vec<(PathBuf, String, bool)>,
+    pub mounts: Vec<HostMount>,
     pub stdin: Option<PathBuf>,
     pub stdout: Option<PathBuf>,
     pub stderr: Option<PathBuf>,

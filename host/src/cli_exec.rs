@@ -2,16 +2,16 @@
 //! stdio inherited, without the control plane. A test harness for tool
 //! drivers (cmd/go, clang) that spawn child wasm processes.
 //!
-//!   wasmdev-host exec [--dir HOST[::GUEST][:ro]]... [--env K=V]... [--cwd GUEST]
+//!   wasmdev-host exec [--dir HOST[::GUEST][:ro][:winch]]... [--max-wasm-stack BYTES] [--winch] [--env K=V]... [--cwd GUEST]
 //!                     [--cache DIR] [--memory-mb N] -- module.wasm [args...]
 
-use crate::exec::{self, Exec, Prepared};
+use crate::exec::{self, Exec, HostMount, Prepared};
+use crate::rt::{Compiler, Runtimes};
 use crate::proc::Stdio;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use wasmtime::{Config, Engine};
 
 pub fn main(args: Vec<String>) -> Result<()> {
     let mut mounts = Vec::new();
@@ -21,6 +21,8 @@ pub fn main(args: Vec<String>) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/wasmdev-host"));
     let mut memory_mb: u64 = 2048;
+    let mut stack: u64 = 0;
+    let mut winch = false;
     let mut it = args.into_iter();
     let mut rest = Vec::new();
     while let Some(f) = it.next() {
@@ -28,6 +30,10 @@ pub fn main(args: Vec<String>) -> Result<()> {
         match f.as_str() {
             "--dir" => {
                 let s = v()?;
+                let (s, winch) = match s.strip_suffix(":winch") {
+                    Some(s) => (s.to_string(), true),
+                    None => (s, false),
+                };
                 let (s, ro) = match s.strip_suffix(":ro") {
                     Some(s) => (s.to_string(), true),
                     None => (s, false),
@@ -37,7 +43,8 @@ pub fn main(args: Vec<String>) -> Result<()> {
                     None => (s.clone(), s.clone()),
                 };
                 let host = PathBuf::from(&host).canonicalize().with_context(|| format!("--dir {host}"))?;
-                mounts.push((host, guest, ro));
+                let compiler = winch.then_some(Compiler::Winch);
+                mounts.push(HostMount { host, guest, readonly: ro, compiler });
             }
             "--env" => {
                 let kv = v()?;
@@ -47,6 +54,8 @@ pub fn main(args: Vec<String>) -> Result<()> {
             "--cwd" => cwd = Some(v()?),
             "--cache" => cache_dir = v()?.into(),
             "--memory-mb" => memory_mb = v()?.parse()?,
+            "--max-wasm-stack" => stack = v()?.parse()?,
+            "--winch" => winch = true,
             "--" => {
                 rest = it.by_ref().collect();
             }
@@ -54,27 +63,18 @@ pub fn main(args: Vec<String>) -> Result<()> {
         }
     }
     if rest.is_empty() {
-        bail!("usage: wasmdev-host exec [--dir HOST[::GUEST][:ro]]... [--env K=V]... [--cwd GUEST] -- module.wasm [args...]");
+        bail!("usage: wasmdev-host exec [--dir HOST[::GUEST][:ro][:winch]]... [--max-wasm-stack BYTES] [--winch] [--env K=V]... [--cwd GUEST] -- module.wasm [args...]");
     }
     if let Some(d) = &cwd {
         env.insert("PWD".into(), d.clone());
     }
 
-    let mut cfg = Config::new();
-    cfg.epoch_interruption(true);
-    cfg.wasm_exceptions(true);
-    cfg.wasm_component_model(true);
-    let engine = Engine::new(&cfg)?;
-    {
-        let engine = engine.clone();
-        std::thread::Builder::new().name("epoch".into()).spawn(move || loop {
-            std::thread::sleep(exec::EPOCH_TICK);
-            engine.increment_epoch();
-        })?;
-    }
-    let cache = crate::cache::ModuleCache::new(&engine, cache_dir)?;
+    let rts = Runtimes::new()?;
+    rts.start_epoch_thread()?;
+    let rt = rts.get(if winch { Compiler::Winch } else { Compiler::Cranelift }, crate::rt::normalize_stack(stack)?)?;
+    let cache = crate::cache::ModuleCache::new(cache_dir)?;
     let ex = Exec::new(
-        engine,
+        rts,
         cache,
         exec::Config {
             data_dir: std::env::temp_dir(),
@@ -89,6 +89,10 @@ pub fn main(args: Vec<String>) -> Result<()> {
     let p = Prepared {
         module,
         component,
+        rt,
+        persist: !winch,
+        spawn: true,
+        tier_up: false,
         precompile_only: false,
         args: rest.clone(),
         env,
