@@ -77,3 +77,15 @@
 ## DECISION D3: adopt wasmdev_proc spawn; Go runs as unmodified cmd/go in wasm
 - Go toolchain support = run real `go` with spawn. Clang = control-plane job-list driver (until an LLVM wasm build can spawn).
 - Verification: coordinator re-running E5 from a clean clone on wasm-x1 (in progress).
+
+## Agent trials round 1 — results (reports in agent-trials/round1/)
+- T1 (Codex, C csvstat): done. 1074 unit checks + 5 CLI e2e pass. Coordinator re-ran its test.sh from wasm-x2: passes.
+- T2 (Codex, C wasip2 KV HTTP service): done; network suite passes from wasm-x2. Coordinator verified from wasm-x1 (third VM): healthz ok, PUT/GET ok, unauth → 307.
+- T3 (Claude Code, C++17 interpreter): done, 20/20 tests.
+- Criteria 3,4,5,6 demonstrated by real agents (C/C++).
+- Friction (ranked by impact):
+  1. C++ compile 30-68 s per 330-line file (YoWASP clang has assertions; libc++ headers). C is fine (0.4-1.3 s/file).
+  2. wasm call-stack limit (wasmtime max_wasm_stack) not configurable/documented; 64 KB default linear stack → confusing OOB fault.
+  3. No pipes/redirection/loops in cmd; test runners must be driven client-side, one HTTP call per test.
+  4. Service URL returned as http://host:port, should be the usable https proxy URL; no readiness wait.
+  5. WASI libc gotchas (tmpfile, long double printf) undocumented.
