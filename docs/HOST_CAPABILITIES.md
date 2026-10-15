@@ -85,6 +85,7 @@ since workloads can create symlinks in their workspaces.
 | CPU time | epoch interruption every 5 ms → yield to executor; `timeout_ms` enforced by trap/cancellation | Never blocks other work; hard timeouts even when the guest is blocked in a host call (the future is dropped). |
 | Memory | `StoreLimits` (`memory_limit_mb`, default `--memory-mb`); max 4 instances per module, 64 per component (wit-component shims) | Bound per-workload memory. |
 | Wasm features | wasmtime defaults + exceptions (`gc`/`gc-drc` cargo features) | C++ built with `-fwasm-exceptions` (exnref encoding) needs the exception-handling proposal; legacy EH is not supported by wasmtime 49. |
+| Child processes (wasip1 core modules only) | `wasmdev_proc.*` imports, see [Process spawn](#process-spawn-wasmdev_proc) | Unmodified tool drivers (`cmd/go`, later clang's driver) orchestrate their own sub-tools (compile, asm, link, vet, test binaries) as further wasm processes. The children are wasm modules found through the caller's own preopens and get no more authority than the caller. |
 
 **Outbound network decision.** Workloads get no outbound network: not
 for builds (reproducibility, no exfiltration of workspace contents, no
@@ -97,8 +98,71 @@ control plane (`ExecSpec.network`: an allow-list of host:port checked in
 `sock_open`).
 
 Not granted to anything: outbound network, UDP, DNS, threads, access
-outside the data dir, host processes, the module cache directory.
+outside the data dir, host (native) processes, the module cache directory.
+Child *wasm* processes are granted (below); native processes are not.
 
+## Process spawn (`wasmdev_proc`)
+
+Why: real toolchains are *drivers* that run other programs. `go build` runs
+`compile`/`asm`/`link` once per package, `go test` additionally runs `vet` and
+the test binary, clang's driver runs `cc1` and `wasm-ld`. Without a spawn
+primitive the orchestration has to be re-implemented outside the tool (e.g.
+`go build -n` plans or `clang -###` job lists replayed by the control plane).
+With it, the unmodified driver runs in wasm and the host only executes what it
+asks for. Process spawn is the only way to get concurrency for single-threaded
+wasip1 tools too: children run on their own host threads, so `go build -p 2`
+really compiles two packages at once.
+
+Every wasip1 workload (and its children, recursively) gets this import module.
+All functions return a WASI errno (0 = success); none of them blocks the
+caller except `wait` with `nohang = 0`.
+
+| Import | Semantics |
+|---|---|
+| `spawn(path, path_len, argv, argv_len, env, env_len, dir, dir_len, fd0, fd1, fd2, *pid, *exit_fd) -> errno` | Start a child. `path`/`dir`: absolute guest paths (UTF-8, not NUL-terminated). `argv`/`env`: concatenated NUL-terminated strings (`env` entries `K=V`; the child gets exactly these plus `PWD=dir`). `fd0..fd2`: **caller** fds to become the child's stdin/stdout/stderr (any file, pipe end, socket, or the caller's own stdio), `-1` = /dev/null. Returns a pid (>= 1000) and an *exit fd*. `ENOENT` (not found via preopens), `EACCES` (not a regular file / resolves outside its mount), `ENOEXEC` (not wasm), `EBADF` (bad stdio fd), `EAGAIN` (limits). |
+| exit fd | A stream socket in the caller's fd table that reaches EOF when the child has exited. The caller waits for it like for any other fd (Go: netpoller via `poll_oneoff`), so a single-threaded guest keeps running its other work (e.g. copying child output) while children run. |
+| `wait(pid, nohang, *status) -> errno` | Reap a child. With `nohang` returns `EAGAIN` while it runs. Status is Unix-encoded: exit code `<< 8`; killed/timed out = signal 9; host-level failure (trap, bad module) = signal 6. `ECHILD` for pids that are not the caller's children. |
+| `kill(pid, sig) -> errno` | Terminate a child (any signal = kill; asynchronous, observe via the exit fd). `ESRCH` if not a child. |
+| `pipe(*fds[2]) -> errno` | A connected pair (read end, write end) of stream fds (a Unix socket pair, shut down in the other direction). Pollable and non-blocking-capable, so Go's `os.Pipe` + netpoller work. |
+| `open_null(write, *fd) -> errno` | A real `/dev/null` fd (Go's `os/exec` opens `os.DevNull` for unset stdio). |
+
+Resolution and isolation:
+- The program path is resolved through the **caller's preopens** (longest
+  guest-prefix match), then canonicalized; it must stay inside that mount
+  (symlinks cannot escape). The file must start with the wasm magic.
+- The child gets exactly the caller's preopens (same guest paths, same
+  read-only/read-write permissions), so absolute paths mean the same thing in
+  parent and child. It cannot gain a directory the parent does not have.
+- `PWD` carries the working directory: wasip1 has no cwd; Go emulates it from
+  `$PWD`. (wasi-libc programs start at `/`; pass them absolute paths.)
+- Children inherit the parent's memory limit, run without a timeout of their
+  own, and are killed when the parent's store is dropped (parent exit, kill or
+  timeout): no orphans. Limits: 64 live children per process, depth 8.
+- Children use the shared compiled-module cache (memory, then disk), so a
+  53 MB `compile` spawn costs ~0.2 s from disk once per host process and
+  ~0 afterwards; a first-ever module (e.g. a new test binary) is compiled by
+  Cranelift on spawn.
+- wasip2 components can be *spawned* (as children) but do not get
+  `wasmdev_proc` themselves.
+
+Guest side: Go needs a small std patch (only for the toolchain binaries, see
+`patches/go/` and `scripts/build-go-toolchain.sh`): `syscall.StartProcess`,
+`Wait4`, `Kill`, `Pipe`, a real `WaitStatus`, `/dev/null` on wasip1;
+`os.Pipe`; `os.(*Process).blockUntilWaitable` reads the exit fd through the
+netpoller; `exec.LookPath` stats files (WASI has no x bits). Programs the
+guest *builds* are compiled against pristine std and do not import
+`wasmdev_proc`.
+
+Test harness without the control plane:
+
+```
+wasmdev-host exec [--dir HOST[::GUEST][:ro]]... [--env K=V]... [--cwd GUEST] \
+                  [--cache DIR] [--memory-mb N] -- module.wasm [args...]
+```
+
+stdio inherited, exit code propagated, `WASMDEV_TRACE_PROC=1` logs one line per
+process (wall time, module load time, cache hit kind). See
+`experiments/e5-spawn/run-go.sh`.
 ## Module cache
 
 Compiled modules and components are cached in memory (key: SHA-256 of
@@ -136,6 +200,15 @@ vendor `wasmtime-wasi` 49.0.3 under `host/vendor/` with a small patch
 - OS sockets are always non-blocking and registered with tokio
   (`AsyncFd`); the guest's NONBLOCK flag is emulated, and "blocking"
   operations await readiness, so they stay cancellable.
+
+Process spawn adds (`src/p1_proc.rs`, `SockKind::Unix`): Unix stream
+sockets as p1 descriptors (pipe ends, exit fds), exporting a guest fd as a
+host object for a child's stdio, and inserting a host file (`/dev/null`).
+
+`poll_oneoff` with a single relative clock subscription used to do a blocking
+`std::thread::sleep` when `allow_blocking_current_thread` is set, which made a
+sleeping workload unkillable (kill/timeout work by dropping the future). The
+patch limits that fast path to sleeps <= 10 ms.
 
 Diff: `git diff <vendor commit> -- host/vendor/` (first commit is the
 pristine crate).
