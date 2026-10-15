@@ -21,7 +21,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 const dataDir = "/data"
@@ -37,6 +36,8 @@ type ExecSpec struct {
 	TimeoutMs     int64             `json:"timeout_ms,omitempty"`
 	MemoryLimitMb int64             `json:"memory_limit_mb,omitempty"`
 	Listen        bool              `json:"listen,omitempty"`
+	// PrecompileOnly asks the host to just compile Module into its cache.
+	PrecompileOnly bool `json:"precompile_only,omitempty"`
 }
 
 type Mount struct {
@@ -56,6 +57,7 @@ type ExecStatus struct {
 	Cache    *string `json:"cache"`
 	Port     *int    `json:"port"`
 	ListenFd *int    `json:"listen_fd"`
+	Kind     *string `json:"kind"` // module (wasip1) | component (wasip2)
 }
 
 var host hostImpl
@@ -67,17 +69,7 @@ type server struct {
 	services map[string]*job
 	tokens   *tokenStore
 	pubHost  string
-}
-
-type job struct {
-	ID        string    `json:"id"`
-	Kind      string    `json:"kind"` // run | service
-	Workspace string    `json:"workspace"`
-	Module    string    `json:"module"`
-	Args      []string  `json:"args"`
-	Started   time.Time `json:"started"`
-	handle    int64
-	dir       string // /data/runs/<id>
+	tools    *toolRegistry
 }
 
 func main() {
@@ -100,7 +92,12 @@ func main() {
 		services: map[string]*job{},
 		tokens:   loadTokens(os.Getenv("WASMDEV_TOKEN")),
 		pubHost:  os.Getenv("WASMDEV_PUBLIC_HOST"),
+		tools:    &toolRegistry{},
 	}
+	s.tools.reload()
+	// Load every registered toolchain into the host's memory cache now
+	// (from its disk cache; compiling if needed) so first calls are fast.
+	go s.tools.warmAll()
 	if s.pubHost == "" {
 		s.pubHost = "127.0.0.1"
 	}
