@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-wasmtime = { version = "49", default-features = false, features = ["cranelift", "cache", "parallel-compilation", "runtime", "std", "async", "pooling-allocator", "anyhow", "wat", "component-model", "addr2line", "demangle"] }
+wasmtime = { version = "49", default-features = false, features = ["cranelift", "cache", "parallel-compilation", "runtime", "std", "async", "pooling-allocator", "anyhow", "wat", "component-model", "addr2line", "demangle", "gc", "gc-drc"] }
 wasmtime-wasi = "49"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

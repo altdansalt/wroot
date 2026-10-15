@@ -156,6 +156,10 @@ fn main() -> Result<()> {
 
     let mut cfg = Config::new();
     cfg.epoch_interruption(true);
+    // C++ built with -fwasm-exceptions (exnref) needs these; both are
+    // wasmtime defaults when the gc feature is compiled in.
+    cfg.wasm_exceptions(true);
+    cfg.wasm_component_model(true);
     let engine = Engine::new(&cfg)?;
     {
         let engine = engine.clone();
@@ -217,6 +221,9 @@ fn main() -> Result<()> {
 
     let t0 = Instant::now();
     let loaded = exec.cache.load(&args.control)?;
+    let cache::Compiled::Module(control_module) = &loaded.module else {
+        bail!("the control plane must be a wasip1 core module, not a component");
+    };
     eprintln!(
         "wasmdev-host: control plane {} loaded in {:.1} ms ({:?}); listening on {}; data {}",
         args.control.display(),
@@ -233,7 +240,7 @@ fn main() -> Result<()> {
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let res = rt.block_on(async {
-        let inst = linker.instantiate_async(&mut store, &loaded.module).await?;
+        let inst = linker.instantiate_async(&mut store, control_module).await?;
         let start = inst.get_typed_func::<(), ()>(&mut store, "_start")?;
         start.call_async(&mut store, ()).await
     });

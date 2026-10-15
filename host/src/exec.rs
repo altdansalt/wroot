@@ -1,21 +1,24 @@
-//! Workload execution: each workload (a wasip1 core module) runs on its own
+//! Workload execution: each workload (a wasip1 core module or a wasip2
+//! component, detected from the binary header) runs on its own
 //! OS thread with a single-threaded tokio runtime, so the control plane is
 //! never blocked. Timeouts and kills use epoch interruption (CPU-bound guest
 //! code) plus future cancellation (guest blocked in a host call such as
 //! `poll_oneoff` or `sock_accept`).
 
-use crate::cache::{CacheResult, ModuleCache};
+use crate::cache::{CacheResult, Compiled, ModuleCache, is_component_file};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::net::TcpListener;
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use wasmtime::component::ResourceTable;
 use wasmtime::{Engine, Linker, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
 use wasmtime_wasi::p1::WasiP1Ctx;
-use wasmtime_wasi::{FsPerms, I32Exit, WasiCtxBuilder};
+use wasmtime_wasi::sockets::SocketAddrUse;
+use wasmtime_wasi::{FsPerms, I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 /// Where the control plane sees the data dir. Spec paths must live under it.
 pub const GUEST_DATA: &str = "/data";
@@ -42,7 +45,12 @@ pub struct ExecSpec {
     /// 0 = host default.
     pub memory_limit_mb: u64,
     /// Request a listening TCP socket (long-running "service" workloads).
+    /// Core modules get a preopened listener fd; components get permission
+    /// to bind/listen on the assigned port only (`$PORT`).
     pub listen: bool,
+    /// Only compile the module into the cache (no instantiation); used to
+    /// warm toolchains when they are registered.
+    pub precompile_only: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -66,6 +74,8 @@ pub struct Status {
     pub cache: Option<CacheResult>,
     pub port: Option<u16>,
     pub listen_fd: Option<u32>,
+    /// "module" (wasip1 core module) or "component" (wasip2).
+    pub kind: Option<&'static str>,
 }
 
 pub struct Job {
@@ -97,6 +107,7 @@ pub struct Exec {
     pub cache: ModuleCache,
     pub cfg: Config,
     linker: Linker<WorkloadState>,
+    clinker: wasmtime::component::Linker<ComponentState>,
     jobs: Mutex<HashMap<i64, Arc<Job>>>,
     next: AtomicI64,
     ports: Mutex<BTreeSet<u16>>,
@@ -107,6 +118,19 @@ pub struct WorkloadState {
     limits: StoreLimits,
 }
 
+/// Store state for wasip2 components.
+pub struct ComponentState {
+    ctx: WasiCtx,
+    table: ResourceTable,
+    limits: StoreLimits,
+}
+
+impl WasiView for ComponentState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView { ctx: &mut self.ctx, table: &mut self.table }
+    }
+}
+
 fn ms(d: Duration) -> f64 {
     (d.as_secs_f64() * 1e6).round() / 1e3
 }
@@ -115,11 +139,14 @@ impl Exec {
     pub fn new(engine: Engine, cache: ModuleCache, cfg: Config) -> Result<Arc<Self>> {
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::p1::add_to_linker_async(&mut linker, |s: &mut WorkloadState| &mut s.wasi)?;
+        let mut clinker = wasmtime::component::Linker::new(&engine);
+        wasmtime_wasi::p2::add_to_linker_async(&mut clinker)?;
         Ok(Arc::new(Exec {
             engine,
             cache,
             cfg,
             linker,
+            clinker,
             jobs: Mutex::new(HashMap::new()),
             next: AtomicI64::new(1),
             ports: Mutex::new(BTreeSet::new()),
@@ -236,6 +263,8 @@ impl Exec {
     /// port is known as soon as `exec_start` returns.
     fn prepare(&self, spec: ExecSpec, job: &Job) -> Result<Prepared> {
         let module = self.host_path(&spec.module, true)?;
+        let component = is_component_file(&module)?;
+        job.status.lock().unwrap().kind = Some(if component { "component" } else { "module" });
         let mut mounts = Vec::new();
         for m in &spec.dirs {
             let host = self.host_path(&m.host, true)?;
@@ -247,12 +276,14 @@ impl Exec {
         let stdin = spec.stdin.as_deref().map(|p| self.host_path(p, true)).transpose()?;
         let stdout = spec.stdout.as_deref().map(|p| self.host_path(p, false)).transpose()?;
         let stderr = spec.stderr.as_deref().map(|p| self.host_path(p, false)).transpose()?;
-        let listener = if spec.listen {
+        let listener = if spec.listen && !spec.precompile_only {
             let (port, l) = self.alloc_listener()?;
             let fd = 3 + mounts.len() as u32;
             let mut s = job.status.lock().unwrap();
             s.port = Some(port);
-            s.listen_fd = Some(fd);
+            // Components bind the port themselves (wasi:sockets); we hold
+            // the reservation until just before the guest starts.
+            s.listen_fd = (!component).then_some(fd);
             Some((fd, l))
         } else {
             None
@@ -260,6 +291,8 @@ impl Exec {
         let mem_mb = if spec.memory_limit_mb > 0 { spec.memory_limit_mb } else { self.cfg.default_memory_mb };
         Ok(Prepared {
             module,
+            component,
+            precompile_only: spec.precompile_only,
             args: spec.args,
             env: spec.env,
             mounts,
@@ -319,6 +352,9 @@ impl Exec {
             s.load_ms = loaded.load_ms;
             s.cache = Some(loaded.cache);
         }
+        if p.precompile_only {
+            return Ok(0);
+        }
         let mut b = WasiCtxBuilder::new();
         // This thread is dedicated to the workload, so file I/O may block it
         // directly instead of bouncing through spawn_blocking.
@@ -326,9 +362,6 @@ impl Exec {
         b.args(&p.args);
         for (k, v) in &p.env {
             b.env(k, v);
-        }
-        if let Some((fd, _)) = &p.listener {
-            b.env("WASMDEV_LISTEN_FD", fd.to_string());
         }
         for (host, guest, ro) in &p.mounts {
             let perms = if *ro { FsPerms::ReadOnly } else { FsPerms::ReadWrite };
@@ -345,42 +378,97 @@ impl Exec {
         if let Some(f) = &p.stderr {
             b.stderr(wasmtime_wasi::cli::OutputFile::new(std::fs::File::create(f)?));
         }
-        let mut wasi = b.build_p1();
-        if let Some((_, l)) = p.listener {
-            wasi.preopen_tcp_listener(l);
+        // Network policy (wasi:sockets; only reachable from components):
+        // no DNS, no UDP, no outbound TCP. A service may bind/listen only on
+        // its assigned port, on an address no wider than --service-bind.
+        b.allow_ip_name_lookup(false).allow_udp(false);
+        let port = p.listener.as_ref().map(|_| job.status.lock().unwrap().port.unwrap());
+        b.allow_tcp(port.is_some());
+        if let Some(port) = port {
+            b.env("PORT", port.to_string());
+            b.env("WASMDEV_PORT", port.to_string());
+            let bind_ip: Option<IpAddr> = self.cfg.service_bind.parse().ok();
+            b.socket_addr_check(move |addr, usage| {
+                let ok = service_socket_allowed(bind_ip, port, addr, usage);
+                Box::pin(async move { ok })
+            });
         }
-        let limits = StoreLimitsBuilder::new().memory_size(p.memory_bytes).instances(4).build();
-        let mut store = Store::new(&self.engine, WorkloadState { wasi, limits });
-        store.limiter(|s| &mut s.limits);
-        // Epoch interruption: every tick, yield to our executor so the
-        // kill/timeout select above gets a chance to run, and trap if a kill
-        // was requested. (Cancellation is by dropping the future.)
-        store.set_epoch_deadline(1);
-        let job2 = job.clone();
-        store.epoch_deadline_callback(move |_| {
-            if job2.kill.load(Ordering::Relaxed) {
-                Ok(UpdateDeadline::Interrupt)
-            } else {
-                Ok(UpdateDeadline::Yield(1))
+        let limits = |instances| StoreLimitsBuilder::new().memory_size(p.memory_bytes).instances(instances).build();
+        match loaded.module {
+            Compiled::Module(module) => {
+                if let Some((fd, _)) = &p.listener {
+                    b.env("WASMDEV_LISTEN_FD", fd.to_string());
+                }
+                let mut wasi = b.build_p1();
+                if let Some((_, l)) = p.listener {
+                    wasi.preopen_tcp_listener(l);
+                }
+                let mut store = Store::new(&self.engine, WorkloadState { wasi, limits: limits(4) });
+                store.limiter(|s| &mut s.limits);
+                interruptible(&mut store, job);
+                let instance = self.linker.instantiate_async(&mut store, &module).await?;
+                let start = instance
+                    .get_typed_func::<(), ()>(&mut store, "_start")
+                    .map_err(anyhow::Error::from)
+                    .context("module has no _start (not a wasip1 command?)")?;
+                exit_code(start.call_async(&mut store, ()).await.map(|()| 0))
             }
-        });
-        // TODO(wasip2): detect components (wasmparser::Parser::is_component)
-        // and run them with wasmtime_wasi::p2::add_to_linker_async +
-        // wasmtime::component::Linker / wasi:cli/command instead. The
-        // ExecSpec/Status contract stays the same; services would get
-        // wasi:sockets instead of a preopened listener fd.
-        let instance = self.linker.instantiate_async(&mut store, &loaded.module).await?;
-        let start = instance
-            .get_typed_func::<(), ()>(&mut store, "_start")
-            .map_err(anyhow::Error::from)
-            .context("module has no _start (not a wasip1 command?)")?;
-        match start.call_async(&mut store, ()).await {
-            Ok(()) => Ok(0),
-            Err(e) => match e.downcast_ref::<I32Exit>() {
-                Some(I32Exit(c)) => Ok(*c),
-                None => Err(e.into()),
-            },
+            Compiled::Component(component) => {
+                // Release the port reservation; the guest binds it itself.
+                drop(p.listener);
+                let state = ComponentState { ctx: b.build(), table: ResourceTable::new(), limits: limits(64) };
+                let mut store = Store::new(&self.engine, state);
+                store.limiter(|s| &mut s.limits);
+                interruptible(&mut store, job);
+                let cmd = wasmtime_wasi::p2::bindings::Command::instantiate_async(&mut store, &component, &self.clinker)
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .context("instantiate component (only wasi:cli/command components are supported)")?;
+                let r = cmd.wasi_cli_run().call_run(&mut store).await;
+                exit_code(r.map(|r| if r.is_ok() { 0 } else { 1 }))
+            }
         }
+    }
+}
+
+/// Socket policy for components started as services.
+fn service_socket_allowed(bind_ip: Option<IpAddr>, port: u16, addr: SocketAddr, usage: SocketAddrUse) -> bool {
+    match usage {
+        SocketAddrUse::TcpBind | SocketAddrUse::TcpListen => {
+            let ip_ok = match bind_ip {
+                None => false,
+                Some(b) if b.is_unspecified() => true,
+                Some(b) => addr.ip() == b || addr.ip().is_loopback(),
+            };
+            ip_ok && addr.port() == port
+        }
+        SocketAddrUse::TcpAccept => true,
+        _ => false, // TcpConnect, UDP: no outbound network
+    }
+}
+
+/// Epoch interruption: every tick, yield to our executor so the kill/timeout
+/// select in `run_thread` gets a chance to run, and trap if a kill was
+/// requested. (Cancellation is by dropping the future.)
+fn interruptible<T>(store: &mut Store<T>, job: &Arc<Job>) {
+    store.set_epoch_deadline(1);
+    let job = job.clone();
+    store.epoch_deadline_callback(move |_| {
+        if job.kill.load(Ordering::Relaxed) {
+            Ok(UpdateDeadline::Interrupt)
+        } else {
+            Ok(UpdateDeadline::Yield(1))
+        }
+    });
+}
+
+fn exit_code(r: wasmtime::Result<i32>) -> Result<i32> {
+    match r {
+        Ok(c) => Ok(c),
+        Err(e) => match e.downcast_ref::<I32Exit>() {
+            Some(I32Exit(c)) => Ok(*c),
+            None => Err(e.into()),
+        },
     }
 }
 
@@ -393,6 +481,9 @@ enum Outcome {
 
 struct Prepared {
     module: PathBuf,
+    #[allow(dead_code)]
+    component: bool,
+    precompile_only: bool,
     args: Vec<String>,
     env: BTreeMap<String, String>,
     mounts: Vec<(PathBuf, String, bool)>,
