@@ -142,7 +142,7 @@ Resolution and isolation:
   53 MB `compile` spawn costs ~0.2 s from disk once per host process and
   ~0 afterwards; a first-ever module (e.g. a new test binary) is compiled by
   Cranelift on spawn.
-- wasip2 components can be *spawned* (as children) but do not get
+- wasip2 components can in principle be spawned as children (untested) but do not get
   `wasmdev_proc` themselves.
 
 Guest side: Go needs a small std patch (only for the toolchain binaries, see
