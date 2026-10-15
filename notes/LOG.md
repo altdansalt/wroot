@@ -96,3 +96,7 @@
 - Control plane: cmd shell with && || ; | (buffered) < > >> 2> 2>&1 and builtins echo/cat/cmp/diff; trap explanations; cc default 1 MiB stack; service url (https public) + local_url + wait_ready/ready_ms; GET / gotchas + Go quickstart.
 - Warm Go loop: build 0.2-0.7 s, vet 0.6 s, test -count=1 1-4 s, net/http service ready ~1-2 s. Cold registration (fresh caches) 3.5-16 min depending on VM noise.
 - Self-hosting (criterion 7): service vets/tests its control plane and builds control.wasm byte-identical to native (-trimpath -buildvcs=false); host restarted on the self-built control.wasm, which rebuilt itself identically. Live service redeployed with it + go tool.
+
+## Coordinator verification after W1 (2026-10-15)
+- E5 from clean clone on wasm-x1 (host build + scripts/build-go-toolchain.sh + run-go.sh go test): EXIT=0; cold 12m03s, warm -count=1 5.7 s.
+- Criterion 7 by hand against the LIVE service (curl only): upload control/, `go vet` 1.0 s, `go test -count=1` 2.0 s (ok), `go build -trimpath -buildvcs=false` 1.7 s → selfbuilt.wasm sha256 d4bf0455… == native build. 
