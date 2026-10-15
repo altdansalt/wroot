@@ -3,8 +3,11 @@
 `wasmdev-host` is the only native code in wasmdev. Everything else — the
 HTTP API, workspace/tool/job bookkeeping, auth — is the control plane, a
 wasip1 module (Go) running inside the host. Workloads (compilers, tests,
-user programs, services) are separate wasm modules that the host compiles
-and runs natively with wasmtime. Wasm is never interpreted inside wasm.
+user programs, services) are separate wasm programs — wasip1 core modules
+or wasip2 components, detected from the binary header — that the host
+compiles and runs natively with wasmtime. Wasm is never interpreted inside
+wasm. Build orchestration (e.g. the clang driver that splits `clang -###`
+into jobs) is control-plane code; the host only executes what it is given.
 
 This file lists every capability the host grants to wasm, and why.
 
@@ -38,9 +41,17 @@ to the host executor; it has no memory limit (it is trusted code).
   "stderr": "/data/runs/j1/stderr",
   "timeout_ms": 60000,                     // 0 = none
   "memory_limit_mb": 512,                  // 0 = host default (--memory-mb)
-  "listen": false                          // true = service, see below
+  "listen": false,                         // true = service, see below
+  "precompile_only": false                 // true = only compile into the cache
 }
 ```
+
+`precompile_only` compiles the module (or loads it from the disk cache)
+into the in-memory cache and finishes with state `exited` without
+instantiating it. The control plane uses it to warm toolchains when they
+are registered and at startup, so the first `cc` call doesn't pay the
+2–4 minute compile of clang. The cache's compile lock serializes compiles
+(one ~1.9 GB clang compile at a time on a 4 GB VM).
 
 All paths are the control plane's view (`/data/...`). The host maps them
 into the data dir, rejects non-normalized paths, and canonicalizes
@@ -51,35 +62,61 @@ since workloads can create symlinks in their workspaces.
 
 ```json
 {"handle": 7, "state": "exited", "done": true, "exit_code": 0, "error": null,
- "wall_ms": 3.2, "load_ms": 0.1, "cache": "memory", "port": null, "listen_fd": null}
+ "wall_ms": 3.2, "load_ms": 0.1, "cache": "memory", "port": null, "listen_fd": null,
+ "kind": "module"}
 ```
 
 `state`: `starting | running | exited | failed | killed | timeout`.
 `cache`: how the compiled module was obtained (`memory | disk | compiled`).
+`kind`: `module` (wasip1 core module) or `component` (wasip2).
 
 ## To workloads
 
 | Capability | How | Why |
 |---|---|---|
-| WASI preview1 | `wasmtime_wasi::p1` (patched, see below) | wasip1 command modules (Go, Rust, C via wasi-libc). |
+| WASI preview1 | `wasmtime_wasi::p1` (patched, see below) | wasip1 command modules (Go, Rust, C via wasi-libc, the clang toolchain itself). |
+| WASI preview2 (`wasi:cli/command` components) | `wasmtime_wasi::p2` component linker; `wasi:cli/run` is called | wasip2 programs (C built with `--target=wasm32-wasip2`), mainly network services. Same spec/status contract as modules. |
 | argv, env | from spec | |
-| Directories | preopens from spec (`dirs`), read-only or read-write | Workspace at `/work`; tool data (sysroots etc.) read-only. Preopens are in spec order starting at fd 3. |
+| Directories | preopens from spec (`dirs`), read-only or read-write | The control plane mounts the workspace at `/work` and `/` (wasi-libc ignores `$PWD`, so relative paths resolve against `/`), and tool data (sysroots) read-only. Preopens are in spec order starting at fd 3. |
 | stdin/stdout/stderr | files in the data dir | Captured output for the API. |
-| Listening TCP socket (services only) | host binds `--service-bind` on a free port in `--service-ports` (default `0.0.0.0`, 8100–8199); preopened at fd `3 + len(dirs)`; `$WASMDEV_LISTEN_FD` | Long-running servers. Only `accept` on that listener — no outbound network, no `sock_open`. Port is released when the workload exits. |
+| Listening TCP socket, wasip1 service | host binds `--service-bind` on a free port in `--service-ports` (default `0.0.0.0`, 8100–8199); preopened at fd `3 + len(dirs)`; `$WASMDEV_LISTEN_FD` | Long-running servers. Only `accept` on that listener — no `sock_open`, no outbound. Port is released when the workload exits. |
+| `wasi:sockets` TCP, wasip2 service | host reserves a free port (bind, held until the guest starts, then released), passes it as `$PORT` / `$WASMDEV_PORT`, and installs a `socket_addr_check` | The guest binds/listens itself. **Allowed:** `TcpBind`/`TcpListen` on exactly the assigned port, on an address no wider than `--service-bind` (any address if that is `0.0.0.0`; else that address or loopback); `TcpAccept` from anyone. **Denied:** `TcpConnect` (all outbound, including loopback, other services and the control plane), UDP (`allow_udp(false)`), DNS (`allow_ip_name_lookup(false)`). Small race: between releasing the reservation and the guest's bind another process could take the port; then the guest's `bind` fails and the service exits. |
+| No sockets, plain runs | components that are not services get `allow_tcp(false)` too | Builds and tests are offline. |
 | CPU time | epoch interruption every 5 ms → yield to executor; `timeout_ms` enforced by trap/cancellation | Never blocks other work; hard timeouts even when the guest is blocked in a host call (the future is dropped). |
-| Memory | `StoreLimits` (`memory_limit_mb`, default `--memory-mb`), max 4 instances | Bound per-workload memory. |
+| Memory | `StoreLimits` (`memory_limit_mb`, default `--memory-mb`); max 4 instances per module, 64 per component (wit-component shims) | Bound per-workload memory. |
+| Wasm features | wasmtime defaults + exceptions (`gc`/`gc-drc` cargo features) | C++ built with `-fwasm-exceptions` (exnref encoding) needs the exception-handling proposal; legacy EH is not supported by wasmtime 49. |
 
-Not granted to anything: outbound network, wasi:sockets (p2), threads,
-access outside the data dir, host processes, the module cache directory.
+**Outbound network decision.** Workloads get no outbound network: not
+for builds (reproducibility, no exfiltration of workspace contents, no
+abuse of the VM's IP), and not for services. Ingress to services is
+through their assigned port only. When agents need outbound access (e.g.
+fetching dependencies), the plan is an explicit per-run grant from the
+control plane (`ExecSpec.network`: an allow-list of host:port checked in
+`socket_addr_check`, plus `allow_ip_name_lookup`) rather than a blanket
+`inherit_network()`. wasip1 modules can't open sockets at all (p1 has no
+`sock_open`).
+
+Not granted to anything: outbound network, UDP, DNS, threads, access
+outside the data dir, host processes, the module cache directory.
 
 ## Module cache
 
-Compiled modules are cached in memory (key: SHA-256 of the wasm bytes,
-memoized on path+size+mtime) and on disk in `<data>.cache/`
+Compiled modules and components are cached in memory (key: SHA-256 of
+the wasm bytes, memoized on path+size+mtime) and on disk in `<data>.cache/`
 (`<sha256>-<engine-compat-hash>.cwasm`, written via `Module::serialize`,
 loaded via `Module::deserialize_file`). The cache dir is a sibling of the
 data dir so no guest can plant a `.cwasm` (deserializing is `unsafe`:
-it trusts the file as native code).
+it trusts the file as native code). Disk hits are deserialized without
+taking the compile lock (so they never wait behind a multi-minute
+compile); misses compile one at a time. After each compile the host calls
+`malloc_trim(0)`: Cranelift's parallel compile otherwise leaves ~1.9 GB
+of freed glibc arena memory resident after compiling clang.
+
+| Module | wasm | compile (this VM, noisy) | .cwasm | load from disk |
+|---|---|---|---|---|
+| clang/lld (llvm.wasm) | 75 MB | 227–254 s, ~1.9 GB peak | 219 MB | 0.6–1.2 s |
+| wasm-tools.wasm | 16 MB | 42 s | 43 MB | 0.2–0.6 s |
+| control.wasm | 12 MB | 22–27 s | 26 MB | 0.1–0.4 s |
 
 ## The wasip1 socket patch
 

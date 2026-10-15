@@ -42,3 +42,11 @@
 ## DECISION D2: add a process-spawn host capability (experiment E5)
 - Both clang driver (spawns wasm-ld) and cmd/go (spawns compile/link/asm) want subprocesses. A generic "spawn a wasm module as child process" capability lets unmodified tool drivers run in wasm; the host only executes, the orchestration stays in the tools.
 - Competing approach already in flight: E4 = clang job list (-###) driven by control plane. Compare after E5.
+
+## E4 result — C/C++ toolchain in the service + wasip2 components (see notes/e4-clang-service.md)
+- `scripts/fetch-toolchains.sh` rebuilds the e2 toolchain from upstream (pinned sha256); byte-identical to wasm-x2's.
+- Tools `llvm` (clang/lld multicall + merged sysroot) and `wasm-tools` registered over HTTP (streamed tar), precompiled at registration (clang: 227–254 s / 1.9 GB here, once) and warmed from disk cache at startup (~1 s).
+- clang driver lives in the control plane (Go/wasm): `clang -###` → each job a separate wasm execution; wasm-component-ld emulated (wasm-ld + wasm-tools). `{"cmd": "cc -O2 -o a.wasm *.c && ./a.wasm"}` works like a shell. Host knows nothing about clang (only gained `precompile_only`).
+- Warm builds: small C 0.3–0.5 s, wasip2 server 0.4 s, C++ (STL+EH) 9 s at -O0 / ~30 s at -O2 (same as wasmtime CLI on this noisy VM).
+- Host runs wasip2 components (auto-detected); component services may only bind their assigned $PORT; no outbound/UDP/DNS. C HTTP server built by wasm clang serves via the services API.
+- Decision (cheap to reverse): spawning is done by control-plane drivers, not a guest "spawn" import, until we need make/sh; then route spawn requests guest → host → control plane.
