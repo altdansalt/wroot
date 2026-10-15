@@ -101,11 +101,21 @@ impl ModuleCache {
         if let Some(m) = self.mem.lock().unwrap().get(&hash) {
             return Ok(done(m.clone(), CacheResult::Memory));
         }
-        let _g = self.compile_lock.lock().unwrap();
-        if let Some(m) = self.mem.lock().unwrap().get(&hash) {
-            return Ok(done(m.clone(), CacheResult::Memory));
-        }
+        // Disk hits are deserialized without the compile lock (cheap, and
+        // must not wait behind another module's multi-minute compile).
         let cpath = self.dir.join(format!("{hash}-{}.cwasm", self.engine_tag));
+        let mut locked = None;
+        loop {
+            if let Some(m) = self.mem.lock().unwrap().get(&hash) {
+                return Ok(done(m.clone(), CacheResult::Memory));
+            }
+            if cpath.exists() || locked.is_some() {
+                break;
+            }
+            // Not on disk: take the compile lock, then re-check memory and
+            // disk (another thread may have just compiled it).
+            locked = Some(self.compile_lock.lock().unwrap());
+        }
         if cpath.exists() {
             // SAFETY: files in the cache dir are only written by this
             // process (below) from `Module::serialize`; the cache dir is
@@ -123,6 +133,10 @@ impl ModuleCache {
                 Err(e) => eprintln!("wasmdev-host: bad cache entry {}: {e:#}", cpath.display()),
             }
         }
+        let _g = match locked {
+            Some(g) => g,
+            None => self.compile_lock.lock().unwrap(),
+        };
         let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         let m = if component {
             Component::new(&self.engine, &bytes).map(Compiled::Component)
@@ -132,6 +146,12 @@ impl ModuleCache {
         .map_err(anyhow::Error::from)
         .with_context(|| format!("compile {}", path.display()))?;
         drop(bytes);
+        // Cranelift compiles functions on many threads; glibc keeps their
+        // freed arenas (≈1.9 GB after clang), so hand them back to the OS.
+        #[cfg(target_env = "gnu")]
+        unsafe {
+            libc::malloc_trim(0);
+        }
         let ser = match &m {
             Compiled::Module(m) => m.serialize(),
             Compiled::Component(c) => c.serialize(),
