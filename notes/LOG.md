@@ -31,3 +31,14 @@
 - Cost: carrying a wasmtime-wasi patch. Exit: if Go gains wasip2, or move ingress to wasi:http.
 - User workloads: wasip1 (Go, C, Python) AND wasip2 components (C servers via wasi:sockets) — both supported.
 - Services exposed on host ports 8100-8199; reachable privately via exe.dev proxy https://altwasm.exe.xyz:PORT (exe.dev auth), no extra proxy layer for now.
+
+## E1 result — Go toolchain as wasip1 (see notes/e1-go-wasm.md)
+- compile/link/asm/pack/go all build for wasip1 unpatched (compile.wasm 53 MB). Hello + net/http server built fully by wasm tools, byte-identical to native.
+- Speed (noisy VM, 30-80% steal): ~4x slower per package single-thread; cold hello (all std) 20.5 s native vs 103 s wasm; warm hello 0.5 s vs 1.1-1.7 s. Peak 0.55 GB.
+- Startup: JIT 127 s, cache 1.0 s, .cwasm 0.08 s → precompile mandatory. Winch/opt-level=0 not worth it. GOGC=off ~20% faster.
+- cmd/go in wasm: `go list -deps` works with a filelock no-op patch; `go build` blocks on subprocess spawn. go test needs _testmain.go (generated in-process by cmd/go).
+- Rejected E1's suggestion to generate build plans/_testmain natively: that would be native logic behind the API.
+
+## DECISION D2: add a process-spawn host capability (experiment E5)
+- Both clang driver (spawns wasm-ld) and cmd/go (spawns compile/link/asm) want subprocesses. A generic "spawn a wasm module as child process" capability lets unmodified tool drivers run in wasm; the host only executes, the orchestration stays in the tools.
+- Competing approach already in flight: E4 = clang job list (-###) driven by control plane. Compare after E5.
