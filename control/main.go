@@ -38,12 +38,25 @@ type ExecSpec struct {
 	Listen        bool              `json:"listen,omitempty"`
 	// PrecompileOnly asks the host to just compile Module into its cache.
 	PrecompileOnly bool `json:"precompile_only,omitempty"`
+	// MaxWasmStack is the wasm call-stack limit in bytes (0 = host default).
+	MaxWasmStack int64 `json:"max_wasm_stack,omitempty"`
+	// Compiler: "cranelift" (default) or "winch".
+	Compiler string `json:"compiler,omitempty"`
+	// Ephemeral: keep the compiled module in memory only (no disk cache).
+	Ephemeral bool `json:"ephemeral,omitempty"`
+	// Spawn grants the wasmdev_proc process-spawn imports.
+	Spawn bool `json:"spawn,omitempty"`
+	// TierUp (with Compiler "winch"): use Cranelift code once the host has
+	// compiled it in the background after a first Winch run.
+	TierUp bool `json:"tier_up,omitempty"`
 }
 
 type Mount struct {
 	Host     string `json:"host"`
 	Guest    string `json:"guest"`
 	Readonly bool   `json:"readonly,omitempty"`
+	// Compiler for modules spawned from this mount (memory-only cache).
+	Compiler string `json:"compiler,omitempty"`
 }
 
 type ExecStatus struct {
@@ -58,6 +71,8 @@ type ExecStatus struct {
 	Port     *int    `json:"port"`
 	ListenFd *int    `json:"listen_fd"`
 	Kind     *string `json:"kind"` // module (wasip1) | component (wasip2)
+	Trap     *string `json:"trap"` // stack_overflow | memory_out_of_bounds | unreachable | ...
+	Compiler *string `json:"compiler"`
 }
 
 var host hostImpl
@@ -69,6 +84,13 @@ type server struct {
 	services map[string]*job
 	tokens   *tokenStore
 	pubHost  string
+	pubURL   string // scheme://host for service URLs ("" = no public URL)
+	cpus     int    // host cores (wasip1's runtime.NumCPU() is always 1)
+	defStack int64  // host default max_wasm_stack
+	// compiler for workspace modules (./app.wasm): "tiered" (default:
+	// Winch first, Cranelift in the background for later runs) |
+	// "cranelift" | "winch"
+	userCompiler string
 	tools    *toolRegistry
 }
 
@@ -94,13 +116,27 @@ func main() {
 		pubHost:  os.Getenv("WASMDEV_PUBLIC_HOST"),
 		tools:    &toolRegistry{},
 	}
-	s.tools.reload()
-	// Load every registered toolchain into the host's memory cache now
-	// (from its disk cache; compiling if needed) so first calls are fast.
-	go s.tools.warmAll()
+	s.cpus, _ = strconv.Atoi(os.Getenv("WASMDEV_HOST_CPUS"))
+	if s.cpus < 1 {
+		s.cpus = 1
+	}
+	s.userCompiler = os.Getenv("WASMDEV_USER_COMPILER")
+	s.defStack, _ = strconv.ParseInt(os.Getenv("WASMDEV_DEFAULT_WASM_STACK"), 10, 64)
 	if s.pubHost == "" {
 		s.pubHost = "127.0.0.1"
 	}
+	if s.pubHost != "127.0.0.1" && s.pubHost != "localhost" {
+		scheme := os.Getenv("WASMDEV_PUBLIC_SCHEME")
+		if scheme == "" {
+			scheme = "https" // e.g. the exe.dev HTTPS proxy
+		}
+		s.pubURL = scheme + "://" + s.pubHost
+	}
+	s.tools.reload()
+	// Load every registered toolchain into the host's memory cache now
+	// (from its disk cache; compiling if needed) so first calls are fast,
+	// then run tool warm-ups (e.g. building std for Go) if not done yet.
+	go s.warmAll()
 	log.Printf("wasmdev control plane listening (fd %d, %s)", fd, ln.Addr())
 	log.Fatal(http.Serve(ln, s.routes()))
 }

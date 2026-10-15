@@ -14,3 +14,4 @@ func (hostImpl) Start(*ExecSpec) (int64, error)    { return 0, errNoHost }
 func (hostImpl) Status(int64) (*ExecStatus, error) { return nil, errNoHost }
 func (hostImpl) Kill(int64) bool                   { return false }
 func (hostImpl) Release(int64) bool                { return false }
+func (hostImpl) Ready(int64) int                   { return -1 }

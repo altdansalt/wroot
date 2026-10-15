@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"log"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -39,9 +40,41 @@ type toolManifest struct {
 	// programs instead of running them directly (e.g. "clang").
 	Driver string     `json:"driver,omitempty"`
 	Clang  *clangConf `json:"clang,omitempty"`
+	// Spawn: the tool runs child processes (wasmdev_proc), e.g. cmd/go
+	// spawning compile/link and test binaries. Children see the same
+	// mounts; the run's max_wasm_stack applies to them.
+	Spawn bool `json:"spawn,omitempty"`
+	// ScratchCompiler: compiler for modules spawned from the scratch dir
+	// (freshly built, run once: Go test binaries) - "winch" compiles ~5x
+	// faster than Cranelift. Such modules are cached in memory only.
+	ScratchCompiler string `json:"scratch_compiler,omitempty"`
+	// Shared: persistent read-write dirs shared by every invocation of
+	// the tool in every workspace (e.g. GOCACHE, which is content-addressed
+	// and safe to share). Stored in /data/cache/<tool>/<name>.
+	Shared []toolShared `json:"shared,omitempty"`
+	// PrecompileModules: more modules (relative to the tool dir) to compile
+	// into the host cache at registration, e.g. the tools cmd/go spawns.
+	PrecompileModules []string `json:"precompile_modules,omitempty"`
+	// Warm: run once after precompiling (in a scratch workspace) so the
+	// first real call is fast, e.g. build+vet+test a program that imports
+	// net/http and testing to fill GOCACHE with the std library.
+	Warm *toolWarm `json:"warm,omitempty"`
+	// Env values may contain {cpus} (host cores).
 
 	Precompile *toolPrecompile `json:"precompile,omitempty"` // runtime status, not stored
 }
+
+type toolShared struct {
+	Name  string `json:"name"`
+	Guest string `json:"guest"`
+}
+
+type toolWarm struct {
+	Files map[string]string `json:"files"`
+	Cmd   string            `json:"cmd"`
+}
+
+func sharedDir(tool, name string) string { return dataDir + "/cache/" + tool + "/" + name }
 
 type toolMount struct {
 	Path  string `json:"path"`  // relative to tool dir
@@ -49,12 +82,14 @@ type toolMount struct {
 }
 
 type toolPrecompile struct {
-	State  string  `json:"state"` // running | done | failed
-	Cache  *string `json:"cache,omitempty"`
-	LoadMs float64 `json:"load_ms,omitempty"`
-	Error  *string `json:"error,omitempty"`
-	handle int64
-	done   chan struct{}
+	State   string  `json:"state"` // running | warming | done | failed
+	Cache   *string `json:"cache,omitempty"`
+	LoadMs  float64 `json:"load_ms,omitempty"`
+	Modules int     `json:"modules,omitempty"` // modules compiled/loaded
+	Ms      float64 `json:"ms,omitempty"`      // total precompile time
+	WarmMs  float64 `json:"warm_ms,omitempty"`
+	Error   *string `json:"error,omitempty"`
+	done    chan struct{}
 }
 
 func toolDir(name string) string { return dataDir + "/tools/" + name }
@@ -146,53 +181,129 @@ func (r *toolRegistry) withStatus(m *toolManifest) *toolManifest {
 	return &c
 }
 
-// finishPrecompile records the outcome; caller holds the registry lock.
-func finishPrecompile(p *toolPrecompile, st *ExecStatus) {
-	if p.State != "running" {
-		return
-	}
-	p.Cache, p.LoadMs, p.Error = st.Cache, st.LoadMs, st.Error
-	if st.State == "exited" {
-		p.State = "done"
-	} else {
-		p.State = "failed"
-	}
-	host.Release(p.handle)
-	close(p.done)
-}
-
-// precompile asks the host to compile the tool's module into its cache
+// precompile asks the host to compile the tool's modules into its cache
 // (memory + disk) in the background, so the first real invocation does
-// not pay for compiling a 75 MB module (~100 s for clang). The host
+// not pay for compiling a 75 MB module (~100-250 s for clang), then runs
+// the tool's warm-up if it has one and it hasn't run yet. The host
 // serializes compiles, so registering several big tools is safe on a
 // small VM. Returns a channel closed when done.
-func (r *toolRegistry) precompile(m *toolManifest) <-chan struct{} {
+func (s *server) precompile(m *toolManifest, forceWarm bool) <-chan struct{} {
+	r := s.tools
 	p := &toolPrecompile{State: "running", done: make(chan struct{})}
-	h, err := host.Start(&ExecSpec{Module: m.modulePath(), Args: []string{m.Name}, PrecompileOnly: true})
-	if err != nil {
-		e := err.Error()
-		p.State, p.Error = "failed", &e
-		close(p.done)
-	} else {
-		p.handle = h
-		go func() {
-			st, _ := waitDone(h, nil)
-			r.mu.Lock()
-			if st != nil {
-				finishPrecompile(p, st)
-			}
-			r.mu.Unlock()
-		}()
-	}
 	r.mu.Lock()
 	r.pre[m.Name] = p
 	r.mu.Unlock()
+	set := func(f func()) {
+		r.mu.Lock()
+		f()
+		r.mu.Unlock()
+	}
+	go func() {
+		defer close(p.done)
+		t0 := time.Now()
+		mods := append([]string{m.Module}, m.PrecompileModules...)
+		for i, rel := range mods {
+			h, err := host.Start(&ExecSpec{Module: toolDir(m.Name) + "/" + path.Clean("/" + rel)[1:],
+				Args: []string{rel}, PrecompileOnly: true})
+			var st *ExecStatus
+			if err == nil {
+				st, err = waitDone(h, nil)
+				host.Release(h)
+			}
+			if err == nil && st.State != "exited" {
+				err = fmt.Errorf("%s: %s", rel, deref(st.Error))
+			}
+			if err != nil {
+				e := err.Error()
+				set(func() { p.State, p.Error = "failed", &e })
+				return
+			}
+			set(func() {
+				p.Modules = i + 1
+				if i == 0 {
+					p.Cache, p.LoadMs = st.Cache, st.LoadMs
+				}
+			})
+		}
+		set(func() { p.Ms = msSince(t0) })
+		if m.Warm == nil {
+			set(func() { p.State = "done" })
+			return
+		}
+		marker := sharedDir(m.Name, ".warm-done")
+		if _, err := os.Stat(marker); err == nil && !forceWarm {
+			set(func() { p.State = "done" })
+			return
+		}
+		set(func() { p.State = "warming" })
+		t1 := time.Now()
+		res, err := s.warmTool(m)
+		set(func() {
+			p.WarmMs = msSince(t1)
+			if err != nil {
+				e := err.Error()
+				p.State, p.Error = "failed", &e
+				return
+			}
+			p.State = "done"
+		})
+		if err == nil {
+			os.MkdirAll(path.Dir(marker), 0o755)
+			os.WriteFile(marker, []byte(res), 0o644)
+		}
+	}()
 	return p.done
 }
 
+// warmTool runs the tool's warm-up command in a scratch workspace,
+// through the same job machinery as an API run.
+func (s *server) warmTool(m *toolManifest) (string, error) {
+	ws := "warm-" + m.Name
+	dir := wsDir(ws)
+	os.RemoveAll(dir)
+	defer os.RemoveAll(dir)
+	for name, body := range m.Warm.Files {
+		rel, ok := cleanRel(name)
+		if !ok {
+			return "", fmt.Errorf("warm: bad file name %q", name)
+		}
+		os.MkdirAll(path.Dir(dir+"/"+rel), 0o755)
+		if err := os.WriteFile(dir+"/"+rel, []byte(body), 0o644); err != nil {
+			return "", err
+		}
+	}
+	req := &runRequest{Cmd: m.Warm.Cmd}
+	j, err := s.startJob(ws, req)
+	if err != nil {
+		return "", fmt.Errorf("warm: %v", err)
+	}
+	<-j.done
+	res := s.jobResult(j)
+	s.mu.Lock()
+	delete(s.jobs, j.ID)
+	s.mu.Unlock()
+	os.RemoveAll(j.dir)
+	b, _ := json.MarshalIndent(res, "", "  ")
+	if ec, _ := res["exit_code"].(*int); res["state"] != "exited" || ec == nil || *ec != 0 {
+		return "", fmt.Errorf("warm-up %q failed: %s", m.Warm.Cmd, b)
+	}
+	log.Printf("tool %s warmed in %.1f s", m.Name, res["wall_ms"].(float64)/1e3)
+	return string(b), nil
+}
+
+func deref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+func msSince(t time.Time) float64 { return float64(time.Since(t).Microseconds()) / 1e3 }
+
 // warmAll precompiles (or loads from the host's disk cache) every
 // registered tool; called at startup.
-func (r *toolRegistry) warmAll() {
+func (s *server) warmAll() {
+	r := s.tools
 	r.mu.Lock()
 	list := make([]*toolManifest, 0, len(r.tools))
 	for _, m := range r.tools {
@@ -201,7 +312,7 @@ func (r *toolRegistry) warmAll() {
 	r.mu.Unlock()
 	sort.Slice(list, func(a, b int) bool { return list[a].Name < list[b].Name })
 	for _, m := range list {
-		r.precompile(m)
+		s.precompile(m, false) // host serializes the compiles
 	}
 }
 
@@ -319,7 +430,7 @@ func (s *server) putTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.tools.reload()
-	done := s.tools.precompile(m)
+	done := s.precompile(m, true)
 	if r.URL.Query().Get("wait") == "1" {
 		select {
 		case <-done:

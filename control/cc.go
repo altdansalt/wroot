@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -32,6 +33,20 @@ type clangConf struct {
 	// standardized exnref encoding, the only one wasmtime accepts).
 	CxxCompileFlags []string `json:"cxx_compile_flags,omitempty"`
 	CxxLinkFlags    []string `json:"cxx_link_flags,omitempty"`
+	// Stack size (bytes) of linked programs unless the user sets one
+	// (-Wl,-z,stack-size=N / -z stack-size=N). wasm-ld's default is 64 KiB,
+	// whose overflow shows up as a confusing out-of-bounds fault.
+	DefaultStackSize int64 `json:"default_stack_size,omitempty"`
+}
+
+// hasStackSize reports whether the link args already set the stack size.
+func hasStackSize(args []string) bool {
+	for _, a := range args {
+		if strings.Contains(a, "stack-size") {
+			return true
+		}
+	}
+	return false
 }
 
 // Flags after which clang only compiles (no link job).
@@ -122,6 +137,9 @@ func clangDriver(rc *runCtx, t *toolManifest, prog string, args []string, scratc
 		if link {
 			args = append(args, conf.CxxLinkFlags...)
 		}
+	}
+	if link && conf.DefaultStackSize > 0 && !hasStackSize(args) {
+		args = append(args, fmt.Sprintf("-Wl,-z,stack-size=%d", conf.DefaultStackSize))
 	}
 
 	sr, out, errOut, err := run(append([]string{prog, "-###"}, args...), true)

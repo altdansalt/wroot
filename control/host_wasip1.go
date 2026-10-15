@@ -23,6 +23,9 @@ func hostExecKill(handle int64) int32
 //go:wasmimport wasmdev exec_release
 func hostExecRelease(handle int64) int32
 
+//go:wasmimport wasmdev exec_ready
+func hostExecReady(handle int64) int32
+
 type hostImpl struct{}
 
 func (hostImpl) Start(spec *ExecSpec) (int64, error) {
@@ -53,3 +56,6 @@ func (hostImpl) Status(h int64) (*ExecStatus, error) {
 
 func (hostImpl) Kill(h int64) bool    { return hostExecKill(h) == 0 }
 func (hostImpl) Release(h int64) bool { return hostExecRelease(h) == 0 }
+
+// Ready reports whether service h accepts connections (-1 = unknown/not a service).
+func (hostImpl) Ready(h int64) int { return int(hostExecReady(h)) }
