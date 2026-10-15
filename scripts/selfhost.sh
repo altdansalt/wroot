@@ -63,7 +63,7 @@ run "go vet ./..."
 [[ $(field .exit_code) == 0 ]] && ok "go vet clean" || { field .stderr; die "vet"; }
 run "go test -v -count=1 ./..."
 field .stdout | grep -E '^(--- |ok|FAIL|PASS)' | sed 's/^/   > /'
-[[ $(field .exit_code) == 0 ]] && ok "control plane unit tests pass (test binary JIT: $(field '.steps[0].compiler // "n/a"'))" || { field .stderr; die "tests"; }
+[[ $(field .exit_code) == 0 ]] && ok "control plane unit tests pass (the test binary ran as a wasm child of go, compiled by Winch)" || { field .stderr; die "tests"; }
 
 say "2. go build control.wasm through the service"
 run "go build -trimpath -buildvcs=false -o control.wasm . && go version"
@@ -79,7 +79,7 @@ stop_host
 say "3. restart the host with the service-built control.wasm"
 t0=$(date +%s%3N)
 start_host "$SELF"
-echo "   API up in $(($(date +%s%3N) - t0)) ms ($(grep 'control plane' "$DATA.log" | tail -1 | grep -o 'loaded in [^;]*'))"
+echo "   API up in $(($(date +%s%3N) - t0)) ms ($(grep 'control plane .* loaded' "$DATA.log" | tail -1 | grep -o 'loaded in [^;]*'))"
 api GET / | head -1 | sed 's/^/   GET \/ > /'
 api GET "/v1/tools/go?wait=1" >/dev/null
 WS=$(api POST /v1/workspaces | jq -r .id)

@@ -370,7 +370,7 @@ func (rc *runCtx) execInvocation(inv *invocation, scratch string) error {
 		return err
 	}
 	args := append(append([]string{}, inv.prefix...), inv.args...)
-	if d := drivers[inv.tool.Driver]; d != nil && len(inv.prefix) > 0 {
+	if d := driver(inv.tool.Driver); d != nil && len(inv.prefix) > 0 {
 		return d(rc, inv.tool, inv.prefix[0], inv.args, scratch)
 	}
 	spec, err := s.toolSpec(ws, rc.req, inv.tool, args, scratch)
@@ -381,10 +381,18 @@ func (rc *runCtx) execInvocation(inv *invocation, scratch string) error {
 	return err
 }
 
-// drivers implement commands that need more than one execution (tools
-// that can't spawn processes themselves). Keyed by toolManifest.Driver.
-var drivers = map[string]func(rc *runCtx, t *toolManifest, prog string, args []string, scratch string) error{
-	"clang": clangDriver,
+// driver returns the implementation of commands that need more than one
+// execution (tools that can't spawn processes themselves), by
+// toolManifest.Driver. (A function, not a package-level map: a map
+// initializer would make the drivers - and through them the wasmdev host
+// imports - reachable in every binary, including `go test` binaries, which
+// then can't be instantiated outside the control plane.)
+func driver(name string) func(rc *runCtx, t *toolManifest, prog string, args []string, scratch string) error {
+	switch name {
+	case "clang":
+		return clangDriver
+	}
+	return nil
 }
 
 // expandGlobs expands unquoted glob words against the workspace; like sh,
