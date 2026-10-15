@@ -6,3 +6,4 @@ target/
 *.cwasm
 /bench-out/
 /build/
+toolchains/
