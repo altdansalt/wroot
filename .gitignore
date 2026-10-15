@@ -1,0 +1,7 @@
+target/
+/data/
+/data-*/
+*.wasm
+!fixtures/**/*.wasm
+*.cwasm
+/bench-out/
