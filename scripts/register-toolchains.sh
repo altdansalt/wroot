@@ -33,7 +33,8 @@ cat >"$T/llvm/tool.json" <<'JSON'
     "componentizer": "wasm-tools",
     "adapter": "/wasm-tools/wasi_snapshot_preview1.command.wasm",
     "cxx_compile_flags": ["-fwasm-exceptions", "-mllvm", "-wasm-use-legacy-eh=false"],
-    "cxx_link_flags": ["-L/usr/lib/wasm32-wasip1-eh", "-lunwind"]
+    "cxx_link_flags": ["-L/usr/lib/wasm32-wasip1-eh", "-lunwind"],
+    "default_stack_size": 1048576
   }
 }
 JSON

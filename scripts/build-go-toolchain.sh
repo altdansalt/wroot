@@ -11,7 +11,7 @@
 #   goroot/                 GOROOT for the guest: PRISTINE go1.27.2 sources
 #                           (src, pkg/include, go.env, VERSION) - so programs
 #                           built in wasm are identical to upstream builds -
-#   goroot/bin/go           cmd/go (wasm, patched std)
+#   goroot/bin/{go,gofmt}   cmd/go (wasm, patched std), gofmt
 #   goroot/pkg/tool/wasip1_wasm/{compile,asm,link,pack,vet,buildid,test2json,cover}
 #                           tools (wasm, patched std; tools are found by name,
 #                           no .wasm suffix, as cmd/go expects)
@@ -66,9 +66,10 @@ export GOROOT=$work GOOS=wasip1 GOARCH=wasm CGO_ENABLED=0 GOTOOLCHAIN=local GOFL
 export GOCACHE=${GOCACHE:-$OUT/gocache-native}
 cd "$work/src"
 "$GOROOT_SRC/bin/go" build -o "$g/bin/go" ./cmd/go
+"$GOROOT_SRC/bin/go" build -o "$g/bin/gofmt" ./cmd/gofmt # for go fmt
 for t in $TOOLS; do
 	"$GOROOT_SRC/bin/go" build -o "$g/pkg/tool/wasip1_wasm/$t" "./cmd/$t"
 done
 ls -la "$g/bin" "$g/pkg/tool/wasip1_wasm"
-sha256sum "$g/bin/go" "$g"/pkg/tool/wasip1_wasm/* >"$OUT/SHA256SUMS"
+sha256sum "$g/bin/go" "$g/bin/gofmt" "$g"/pkg/tool/wasip1_wasm/* >"$OUT/SHA256SUMS"
 echo "done: $g"
