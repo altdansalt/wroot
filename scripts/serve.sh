@@ -7,7 +7,8 @@ cd "$(dirname "$0")/.."
 DATA=${DATA:-$HOME/wasmdev-data}
 PORT=${PORT:-8700}
 mkdir -p "$DATA"
-[[ -f build/control.wasm ]] || (cd control && GOOS=wasip1 GOARCH=wasm go build -o ../build/control.wasm .)
+# Reproducible build (same flags the service itself uses, see scripts/selfhost.sh).
+(cd control && GOOS=wasip1 GOARCH=wasm CGO_ENABLED=0 /usr/local/go/bin/go build -trimpath -buildvcs=false -o ../build/control.wasm .)
 export WASMDEV_TOKEN=$(cat "$HOME/.config/wasmdev/api_token")
 exec host/target/release/wasmdev-host --control build/control.wasm --listen "0.0.0.0:$PORT" \
   --data "$DATA" --service-bind 0.0.0.0 --service-ports 8100-8199 \
