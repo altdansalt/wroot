@@ -6,6 +6,7 @@
 //! `poll_oneoff` or `sock_accept`).
 
 use crate::cache::{CacheResult, Compiled, ModuleCache, is_component_file};
+use crate::proc::Stdio;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -114,8 +115,10 @@ pub struct Exec {
 }
 
 pub struct WorkloadState {
-    wasi: WasiP1Ctx,
+    pub(crate) wasi: WasiP1Ctx,
     limits: StoreLimits,
+    /// Process-spawn state (`wasmdev_proc` imports, see proc.rs).
+    pub(crate) proc: Option<crate::proc::ProcCtx>,
 }
 
 /// Store state for wasip2 components.
@@ -139,6 +142,7 @@ impl Exec {
     pub fn new(engine: Engine, cache: ModuleCache, cfg: Config) -> Result<Arc<Self>> {
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::p1::add_to_linker_async(&mut linker, |s: &mut WorkloadState| &mut s.wasi)?;
+        crate::proc::add_to_linker(&mut linker)?;
         let mut clinker = wasmtime::component::Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut clinker)?;
         Ok(Arc::new(Exec {
@@ -247,6 +251,30 @@ impl Exec {
         handle
     }
 
+    /// Start an already-validated workload (used for child processes).
+    pub(crate) fn start_prepared(self: &Arc<Self>, p: Prepared) -> (i64, Arc<Job>) {
+        let handle = self.next.fetch_add(1, Ordering::SeqCst);
+        let job = Arc::new(Job {
+            status: Mutex::new(Status {
+                handle,
+                state: "starting",
+                kind: Some(if p.component { "component" } else { "module" }),
+                ..Default::default()
+            }),
+            started: Instant::now(),
+            kill: AtomicBool::new(false),
+            kill_notify: tokio::sync::Notify::new(),
+        });
+        self.jobs.lock().unwrap().insert(handle, job.clone());
+        let me = self.clone();
+        let j = job.clone();
+        std::thread::Builder::new()
+            .name(format!("workload-{handle}"))
+            .spawn(move || me.run_thread(j, p))
+            .expect("spawn workload thread");
+        (handle, job)
+    }
+
     fn finish(&self, job: &Job, state: &'static str, code: Option<i32>, err: Option<String>) {
         let mut s = job.status.lock().unwrap();
         s.state = state;
@@ -302,12 +330,19 @@ impl Exec {
             timeout: (spec.timeout_ms > 0).then(|| Duration::from_millis(spec.timeout_ms)),
             memory_bytes: (mem_mb as usize) << 20,
             listener,
+            stdio: None,
+            exit_notify: None,
+            depth: 0,
+            trace: None,
         })
     }
 
-    fn run_thread(self: Arc<Self>, job: Arc<Job>, p: Prepared) {
+    fn run_thread(self: Arc<Self>, job: Arc<Job>, mut p: Prepared) {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let timeout = p.timeout;
+        // Closed (EOF for the parent) only after the final status is set.
+        let exit_notify = p.exit_notify.take();
+        let trace = p.trace.take();
         let outcome = rt.block_on(async {
             let run = self.run_workload(&job, p);
             let killed = job.kill_notify.notified();
@@ -335,16 +370,34 @@ impl Exec {
             Outcome::Killed => self.finish(&job, "killed", None, Some("killed".into())),
             Outcome::Timeout => self.finish(&job, "timeout", None, Some("timeout".into())),
         }
+        // Drop the runtime (and with it any stdio stream tasks) before
+        // signalling exit, so the parent sees output EOF promptly too.
+        drop(rt);
+        if let Some(path) = trace {
+            let s = job.status();
+            eprintln!(
+                "[proc] pid={} {} {} code={:?} wall={:.0}ms load={:.1}ms cache={:?}{}",
+                s.handle,
+                path,
+                s.state,
+                s.exit_code,
+                s.wall_ms,
+                s.load_ms,
+                s.cache,
+                s.error.map(|e| format!(" error={e}")).unwrap_or_default()
+            );
+        }
+        drop(exit_notify);
     }
 
-    async fn run_workload(&self, job: &Arc<Job>, p: Prepared) -> Outcome {
+    async fn run_workload(self: &Arc<Self>, job: &Arc<Job>, p: Prepared) -> Outcome {
         match self.run_inner(job, p).await {
             Ok(code) => Outcome::Exited(code),
             Err(e) => Outcome::Failed(format!("{e:#}")),
         }
     }
 
-    async fn run_inner(&self, job: &Arc<Job>, p: Prepared) -> Result<i32> {
+    async fn run_inner(self: &Arc<Self>, job: &Arc<Job>, mut p: Prepared) -> Result<i32> {
         let loaded = self.cache.load(&p.module)?;
         {
             let mut s = job.status.lock().unwrap();
@@ -369,14 +422,19 @@ impl Exec {
                 .map_err(anyhow::Error::from)
                 .with_context(|| format!("mount {}", host.display()))?;
         }
-        if let Some(f) = &p.stdin {
-            b.stdin(wasmtime_wasi::cli::InputFile::new(std::fs::File::open(f)?));
-        }
-        if let Some(f) = &p.stdout {
-            b.stdout(wasmtime_wasi::cli::OutputFile::new(std::fs::File::create(f)?));
-        }
-        if let Some(f) = &p.stderr {
-            b.stderr(wasmtime_wasi::cli::OutputFile::new(std::fs::File::create(f)?));
+        let stdio = match p.stdio.take() {
+            Some(s) => s,
+            None => [
+                p.stdin.as_ref().map(std::fs::File::open).transpose()?,
+                p.stdout.as_ref().map(std::fs::File::create).transpose()?,
+                p.stderr.as_ref().map(std::fs::File::create).transpose()?,
+            ]
+            .map(|f| f.map_or(Stdio::Null, Stdio::File)),
+        };
+        // Keep copies so children can be handed this workload's stdio.
+        let own_stdio = [stdio[0].try_clone()?, stdio[1].try_clone()?, stdio[2].try_clone()?];
+        for (i, s) in stdio.into_iter().enumerate() {
+            s.apply(&mut b, i as u8)?;
         }
         // Network policy (wasi:sockets; only reachable from components):
         // no DNS, no UDP, no outbound TCP. A service may bind/listen only on
@@ -403,7 +461,8 @@ impl Exec {
                 if let Some((_, l)) = p.listener {
                     wasi.preopen_tcp_listener(l);
                 }
-                let mut store = Store::new(&self.engine, WorkloadState { wasi, limits: limits(4) });
+                let proc = crate::proc::ProcCtx::new(self.clone(), p.mounts.clone(), own_stdio, p.memory_bytes, p.depth);
+                let mut store = Store::new(&self.engine, WorkloadState { wasi, limits: limits(4), proc: Some(proc) });
                 store.limiter(|s| &mut s.limits);
                 interruptible(&mut store, job);
                 let instance = self.linker.instantiate_async(&mut store, &module).await?;
@@ -479,18 +538,26 @@ enum Outcome {
     Timeout,
 }
 
-struct Prepared {
-    module: PathBuf,
-    #[allow(dead_code)]
-    component: bool,
-    precompile_only: bool,
-    args: Vec<String>,
-    env: BTreeMap<String, String>,
-    mounts: Vec<(PathBuf, String, bool)>,
-    stdin: Option<PathBuf>,
-    stdout: Option<PathBuf>,
-    stderr: Option<PathBuf>,
-    timeout: Option<Duration>,
-    memory_bytes: usize,
-    listener: Option<(u32, TcpListener)>,
+pub(crate) struct Prepared {
+    pub module: PathBuf,
+    pub component: bool,
+    pub precompile_only: bool,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub mounts: Vec<(PathBuf, String, bool)>,
+    pub stdin: Option<PathBuf>,
+    pub stdout: Option<PathBuf>,
+    pub stderr: Option<PathBuf>,
+    pub timeout: Option<Duration>,
+    pub memory_bytes: usize,
+    pub listener: Option<(u32, TcpListener)>,
+    /// Stdio objects (child processes, `wasmdev-host exec`); overrides
+    /// stdin/stdout/stderr paths.
+    pub stdio: Option<[Stdio; 3]>,
+    /// Dropped when the workload has finished (parent's exit fd -> EOF).
+    pub exit_notify: Option<std::os::unix::net::UnixStream>,
+    /// Process nesting depth (0 = started by the control plane).
+    pub depth: u32,
+    /// Log a one-line summary to stderr when done (WASMDEV_TRACE_PROC).
+    pub trace: Option<String>,
 }

@@ -1,0 +1,40 @@
+diff --git a/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go b/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go
+index b16709e..9a1f6f3 100644
+--- a/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go
++++ b/src/cmd/go/internal/lockedfile/internal/filelock/filelock_other.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !unix && !windows
++//go:build !unix && !windows && !wasip1
+ 
+ package filelock
+ 
+diff --git a/src/cmd/go/internal/lockedfile/internal/filelock/filelock_wasip1.go b/src/cmd/go/internal/lockedfile/internal/filelock/filelock_wasip1.go
+new file mode 100644
+index 0000000..6bb0479
+--- /dev/null
++++ b/src/cmd/go/internal/lockedfile/internal/filelock/filelock_wasip1.go
+@@ -0,0 +1,21 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build wasip1
++
++package filelock
++
++// WASI preview1 has no advisory locks. Treat locks as no-ops; the host
++// sandbox is expected to serialize access to shared caches.
++
++type lockType int8
++
++const (
++	readLock = iota + 1
++	writeLock
++)
++
++func lock(f File, lt lockType) error { return nil }
++
++func unlock(f File) error { return nil }

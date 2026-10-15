@@ -1,0 +1,15 @@
+build-cold-p1                   333.3s  rc=0  steal= 57%  rss= 579MB
+build-cold-p2                   229.8s  rc=0  steal= 66%  rss= 590MB
+build-warm-noop                   3.1s  rc=0  steal= 55%  rss= 102MB
+build-warm-edit-calc              6.2s  rc=0  steal= 57%  rss= 192MB
+test-cold-p1                    576.6s  rc=0  steal= 56%  rss= 335MB
+test-cold-p2                    362.2s  rc=0  steal= 75%  rss= 629MB
+test-warm-cached                  3.5s  rc=0  steal= 55%  rss= 122MB
+test-warm-count1                  7.4s  rc=0  steal= 65%  rss= 330MB
+test-warm-edit-calc               7.8s  rc=0  steal= 58%  rss= 276MB
+test-failing-variant              9.5s  rc=1  steal= 69%  rss= 382MB
+vet-warm                         31.9s  rc=0  steal= 56%  rss= 231MB
+native-build-cold-p1             35.3s  rc=0  steal= 65%  rss= 204MB
+native-test-c-cold-p1            74.5s  rc=0  steal= 65%  rss= 203MB
+native-build-cold-p2             34.9s  rc=0  steal= 75%  rss= 194MB
+native-test-c-cold-p2            71.1s  rc=0  steal= 82%  rss= 195MB

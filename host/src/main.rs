@@ -7,7 +7,9 @@
 //! See docs/HOST_CAPABILITIES.md.
 
 mod cache;
+mod cli_exec;
 mod exec;
+mod proc;
 
 use anyhow::{Context, Result, bail};
 use exec::{EPOCH_TICK, Exec, GUEST_DATA};
@@ -150,6 +152,9 @@ fn add_wasmdev_imports(linker: &mut Linker<ControlState>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("exec") {
+        return cli_exec::main(std::env::args().skip(2).collect());
+    }
     let args = parse_args()?;
     std::fs::create_dir_all(&args.data)?;
     let data_dir = args.data.canonicalize()?;

@@ -90,6 +90,10 @@ use wiggle::tracing::instrument;
 // wasmdev patch: p1 socket support (see p1_socket.rs)
 #[path = "p1_socket.rs"]
 mod socket;
+// wasmdev patch: process-spawn support (see p1_proc.rs)
+#[path = "p1_proc.rs"]
+mod proc_fds;
+pub use proc_fds::HostFd;
 use wiggle::{GuestError, GuestMemory, GuestPtr, GuestType};
 
 // Bring all WASI traits in scope that this implementation builds on.
@@ -2398,6 +2402,10 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                     .flags
                     .contains(types::Subclockflags::SUBSCRIPTION_CLOCK_ABSTIME)
                     && self.wasi.filesystem.allow_blocking_current_thread
+                    // wasmdev patch: a blocking sleep cannot be cancelled
+                    // (kill/timeout drop the future), so only short sleeps
+                    // take this path; longer ones use the async timer below.
+                    && clocksub.timeout <= 10_000_000
                 {
                     std::thread::sleep(std::time::Duration::from_nanos(clocksub.timeout));
                     memory.write(
