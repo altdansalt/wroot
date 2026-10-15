@@ -89,3 +89,10 @@
   3. No pipes/redirection/loops in cmd; test runners must be driven client-side, one HTTP call per test.
   4. Service URL returned as http://host:port, should be the usable https proxy URL; no readiness wait.
   5. WASI libc gotchas (tmpfile, long double printf) undocumented.
+
+## W1 — Go first-class + round-1 fixes + self-hosting (notes/w1.md)
+- Merged e5-spawn. Go registered as tool "go" over the API (scripts/register-go.sh): spawn grant, shared GOCACHE (/data/cache/go), -p=host cores, GOPROXY=off, test binaries via Winch, 10 modules precompiled + std warm-up at registration.
+- Host: engines per (compiler, max_wasm_stack); 8 MiB default wasm stack (per-run up to 256 MiB); Winch + background Cranelift tier-up for workspace programs/services (Winch compiles ~5x faster, code ~2x slower); trap codes; exec_ready; spawn opt-in; separate compile lock for small modules (user programs waited 70-87 s behind toolchain compiles).
+- Control plane: cmd shell with && || ; | (buffered) < > >> 2> 2>&1 and builtins echo/cat/cmp/diff; trap explanations; cc default 1 MiB stack; service url (https public) + local_url + wait_ready/ready_ms; GET / gotchas + Go quickstart.
+- Warm Go loop: build 0.2-0.7 s, vet 0.6 s, test -count=1 1-4 s, net/http service ready ~1-2 s. Cold registration (fresh caches) 3.5-16 min depending on VM noise.
+- Self-hosting (criterion 7): service vets/tests its control plane and builds control.wasm byte-identical to native (-trimpath -buildvcs=false); host restarted on the self-built control.wasm, which rebuilt itself identically. Live service redeployed with it + go tool.
