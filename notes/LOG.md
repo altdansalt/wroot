@@ -65,3 +65,15 @@
 - T1 Codex@wasm-x2: C csvstat library + unit/e2e tests.
 - T2 Codex@wasm-x2: C HTTP KV service, run as service, tested over network from wasm-x2.
 - T3 Claude Code@altwasm: interpreter in C++17 with test suite.
+
+## E5 result — process spawn + unmodified cmd/go in wasm (branch e5-spawn, notes/e5-spawn.md)
+- Host capability `wasmdev_proc` (spawn/wait/kill/pipe/open_null); children resolved via parent's mounts, run on own threads, shared module cache; exit-fd becomes EOF on exit so single-threaded Go waits without blocking. Spawn round trip 1-2 ms.
+- go version/env/build/vet/test work on a 3-package module, every process wasm. Binary byte-identical to native (-trimpath). Toolchain build reproducible (identical hashes on 2 VMs).
+- Go patches: filelock no-op, StartProcess via wasmdev_proc, runtime notetsleepg park-not-spin (upstream bug: signal.Notify livelocked I/O on wasip1). User code compiles against pristine go1.27.2 std.
+- Host fix: blocking poll_oneoff sleep made sleeping workloads unkillable — capped.
+- Timings (wasm-x1, heavy steal): go build cold 230 s (-p 2) vs native 35 s; warm no-op 3.1 s, after edit 6.2 s; go test warm -count=1 7.4 s. New test binary module compile 19.6 s cranelift vs 3-4.5 s winch → use winch for fresh, short-lived modules.
+- YoWASP llvm.wasm refuses all subprocesses → clang keeps E4's job-list driver.
+
+## DECISION D3: adopt wasmdev_proc spawn; Go runs as unmodified cmd/go in wasm
+- Go toolchain support = run real `go` with spawn. Clang = control-plane job-list driver (until an LLVM wasm build can spawn).
+- Verification: coordinator re-running E5 from a clean clone on wasm-x1 (in progress).
