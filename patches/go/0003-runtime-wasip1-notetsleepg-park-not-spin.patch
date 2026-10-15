@@ -1,0 +1,41 @@
+diff --git a/src/runtime/lock_wasip1.go b/src/runtime/lock_wasip1.go
+index 9bf5a4b..cbcb49d 100644
+--- a/src/runtime/lock_wasip1.go
++++ b/src/runtime/lock_wasip1.go
+@@ -92,17 +92,31 @@ func notetsleepg(n *note, ns int64) bool {
+ 		throw("notetsleepg on g0")
+ 	}
+ 
++	// wasmdev patch: this used to loop on Gosched, which keeps a goroutine
++	// permanently runnable. wasm has no sysmon thread, so the scheduler
++	// then never blocks in netpoll and goroutines waiting for I/O starve
++	// (e.g. signal.Notify's receiver, parked here forever, livelocks any
++	// program that also waits on a pipe). Park on a timer instead, with
++	// backoff, so the scheduler can go idle in poll_oneoff.
+ 	deadline := nanotime() + ns
++	sleep := int64(20_000) // 20µs, doubling up to 10ms
+ 	for {
+ 		if n.key != 0 {
+ 			return true
+ 		}
+-		if sched_yield() != 0 {
+-			throw("sched_yield failed")
++		d := sleep
++		if ns >= 0 {
++			rem := deadline - nanotime()
++			if rem <= 0 {
++				return false
++			}
++			if rem < d {
++				d = rem
++			}
+ 		}
+-		Gosched()
+-		if ns >= 0 && nanotime() >= deadline {
+-			return false
++		timeSleep(d)
++		if sleep < 10_000_000 {
++			sleep *= 2
+ 		}
+ 	}
+ }
