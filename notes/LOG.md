@@ -100,3 +100,7 @@
 ## Coordinator verification after W1 (2026-10-15)
 - E5 from clean clone on wasm-x1 (host build + scripts/build-go-toolchain.sh + run-go.sh go test): EXIT=0; cold 12m03s, warm -count=1 5.7 s.
 - Criterion 7 by hand against the LIVE service (curl only): upload control/, `go vet` 1.0 s, `go test -count=1` 2.0 s (ok), `go build -trimpath -buildvcs=false` 1.7 s → selfbuilt.wasm sha256 d4bf0455… == native build. 
+
+## Repo
+- Pushed to github.com/altdansalt/wroot (public) via exe.dev GitHub integration (https://github.int.exe.xyz/altdansalt/wroot.git, remote `origin`). History scanned for tokens before first push: clean.
+- Workers push to feature branches; coordinator reviews/merges to main.
