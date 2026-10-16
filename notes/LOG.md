@@ -104,3 +104,8 @@
 ## Repo
 - Pushed to github.com/altdansalt/wroot (public) via exe.dev GitHub integration (https://github.int.exe.xyz/altdansalt/wroot.git, remote `origin`). History scanned for tokens before first push: clean.
 - Workers push to feature branches; coordinator reviews/merges to main.
+
+## 2026-10-16 wind-down (at owner's request)
+- Helper VMs wasm-x1, wasm-x2 deleted (token cannot stop, only rm). Trial dirs + logs archived to ~/archive/ on altwasm first.
+- Live wasmdev service on altwasm stopped (restart: `setsid nohup scripts/serve.sh > ~/wasmdev-serve.log 2>&1 &`; data/caches kept in ~/wasmdev-data).
+- No agents running.
