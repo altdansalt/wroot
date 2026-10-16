@@ -1,0 +1,566 @@
+diff -ruN control.original/PIPELINES.md control/PIPELINES.md
+--- control.original/PIPELINES.md	1970-01-01 00:00:00.000000000 +0000
++++ control/PIPELINES.md	2026-10-15 17:44:13.718042058 +0000
+@@ -0,0 +1,49 @@
++# Pipeline execution and host boundary
++
++`cmd` streams pipelines of two or more builtins when none has redirections.
++Each stage has an independent run context and goroutine. Adjacent stages use
++`io.Pipe`: writes wait for reads, so intermediate storage is bounded rather
++than proportional to output. Closing a consumer closes its pipe reader and
++unblocks writers with `io.ErrClosedPipe`. Producers close writers to deliver
++EOF. All stages are joined, including after cancellation. Job kill/deadline
++checks run every 5 ms and close the internal endpoints. Steps retain command
++order, and the last stage determines pipeline status (no pipefail).
++
++`cat` now copies inputs incrementally, including on the spool path. `cmp`
++and `diff` still materialize inputs because their existing algorithms need
++them. Builtin `echo` constructs its argument output in memory. The response's
++existing inline output cap is unchanged; final job output remains on disk.
++
++Pipelines with wasm commands or redirections retain sequential disk spooling.
++Redirections deliberately retain the old ordering of filesystem side effects
++and descriptor bindings. Mixed pipelines are not split into streaming islands.
++Spool files are removed as each consumer finishes or its producer fails. This
++is not a claim that `yes.wasm | head.wasm` now terminates: it still needs a
++request timeout. Disk spooling does not bound disk usage for an endless producer.
++
++## Why host executions cannot stream yet
++
++`ExecSpec` in main.go exposes Stdin, Stdout, Stderr as path strings. `step` in
++exec.go starts one execution, polls until done, and then moves/appends its
++output. The imports in host_wasip1.go expose only start/status/kill/release/ready.
++There is no pipe allocation, guest stream read/write, descriptor transfer, or
++way to attach an execution to another execution's stdio. A regular file's
++current EOF is not a blocking pipe EOF. Polling/tailing it cannot fix a wasm
++consumer that has already observed EOF. WASI preview 1 also supplies no usable
++FIFO creation interface here. This change adds no speculative host imports.
++
++A host extension should allocate bounded anonymous pipes and return separate
++read/write endpoint IDs. ExecSpec must accept these endpoints for stdin/stdout/
++stderr, including stderr aliases. Start must retain child endpoint references;
++the control plane must be able to close its own references explicitly. Reads
++must block until data or final writer closure; writes must apply backpressure
++and report broken pipe when the final reader closes. A nonblocking host read/
++write API with pollable readiness is needed to connect builtin stages to those
++same endpoints. Endpoint cleanup must cover failed starts, traps, cancellation,
++and release. The host must support these semantics for both wasip1 and wasip2.
++
++The future scheduler must resolve/apply redirections, start all stages before
++waiting, close unused endpoints, track and kill *all* active handles (job.handle
++currently tracks only one), join all executions, preserve per-stage steps in
++command order, and stop siblings on abnormal failure. Starting multiple current
++ExecSpecs against the same regular file does not provide these semantics.
+diff -ruN control.original/doc.go control/doc.go
+--- control.original/doc.go	2026-10-15 17:24:14.000000000 +0000
++++ control/doc.go	2026-10-15 17:42:53.247310404 +0000
+@@ -49,7 +49,7 @@
+ "cmd" is a small shell:
+   - words, '...' and "..." quoting, backslash escapes, globs (*.c ? [..]) against the workspace
+   - a && b, a || b, a ; b   (exit_code = last command run, like sh)
+-  - a | b                   pipes are BUFFERED: a runs to completion, then b reads its output
++  - a | b                   builtin-only pipelines without redirections stream; others spool to disk
+   - < file, > file, >> file, 2> file, 2>> file, 2>&1   (paths relative to the workspace)
+   - builtins: echo [-n], cat [files|-], cmp A B, diff A B (unified-style, exit 1 if different), true, false
+   - no variables ($X), substitution, subshells, loops, background jobs, cd (use "go -C dir" or paths)
+diff -ruN control.original/exec.go control/exec.go
+--- control.original/exec.go	2026-10-15 17:27:26.000000000 +0000
++++ control/exec.go	2026-10-15 17:44:26.997835690 +0000
+@@ -108,6 +108,11 @@
+ 	abn      *stepResult
+ 	status   int // exit status of the last command
+ 	nscratch int
++	// Only builtin stages use these in-process streams. Host executions
++	// still require filesystem paths in ExecSpec.
++	input    io.Reader
++	output   io.Writer
++	writeErr error
+ }
+ 
+ func (rc *runCtx) stdoutPath() string {
+@@ -208,7 +213,16 @@
+ func (rc *runCtx) stderr(text string) { appendText(rc.stderrPath(), text) }
+ 
+ // stdout appends text to the command's stdout (builtins).
+-func (rc *runCtx) stdout(text string) { appendText(rc.stdoutPath(), text) }
++func (rc *runCtx) stdout(text string) {
++	if rc.output != nil {
++		_, err := io.WriteString(rc.output, text)
++		if err != nil {
++			rc.writeErr = err
++		}
++		return
++	}
++	appendText(rc.stdoutPath(), text)
++}
+ 
+ func appendText(p, text string) {
+ 	if text == "" {
+diff -ruN control.original/pipeline.go control/pipeline.go
+--- control.original/pipeline.go	1970-01-01 00:00:00.000000000 +0000
++++ control/pipeline.go	2026-10-15 17:44:27.061834699 +0000
+@@ -0,0 +1,137 @@
++package main
++
++import (
++	"io"
++	"os"
++	"sync"
++	"time"
++)
++
++// Keep redirections on the established sequential path: their filesystem
++// side effects and ordered 2>&1 bindings must not race other stages.
++func streamable(pl pipeline) bool {
++	if len(pl.Cmds) < 2 {
++		return false
++	}
++	for _, c := range pl.Cmds {
++		if len(c.Words) == 0 || len(c.Redirs) != 0 || !isBuiltin(unmark(c.Words[0])) {
++			return false
++		}
++	}
++	return true
++}
++
++type streamStage func(io.Reader, io.Writer) int
++
++// pipeStages owns every pipe endpoint. Closing a consumer's reader wakes
++// blocked producers with ErrClosedPipe; closing a producer delivers EOF.
++// io.Pipe has no intermediate buffer and therefore provides backpressure.
++// Endpoints supplied by the caller are borrowed, never closed here.
++func pipeStages(stages []streamStage, input io.Reader, output io.Writer, stop <-chan struct{}) ([]int, error) {
++	readers := make([]*io.PipeReader, len(stages)-1)
++	writers := make([]*io.PipeWriter, len(readers))
++	for i := range readers {
++		readers[i], writers[i] = io.Pipe()
++	}
++	closePipes := func(err error) {
++		for i := range readers {
++			readers[i].CloseWithError(err)
++			writers[i].CloseWithError(err)
++		}
++	}
++	finished, watched := make(chan struct{}), make(chan struct{})
++	go func() {
++		defer close(watched)
++		select {
++		case <-stop:
++			closePipes(errStop)
++		case <-finished:
++		}
++	}()
++	statuses := make([]int, len(stages))
++	var wg sync.WaitGroup
++	for i, stage := range stages {
++		wg.Add(1)
++		go func(i int, stage streamStage) {
++			defer wg.Done()
++			in, out := input, output
++			if i > 0 {
++				in = readers[i-1]
++				defer readers[i-1].Close()
++			}
++			if i < len(writers) {
++				out = writers[i]
++				defer writers[i].Close()
++			}
++			statuses[i] = stage(in, out)
++		}(i, stage)
++	}
++	wg.Wait()
++	close(finished)
++	<-watched
++	closePipes(nil)
++	select {
++	case <-stop:
++		return statuses, errStop
++	default:
++		return statuses, nil
++	}
++}
++
++func (rc *runCtx) runBuiltinPipeline(pl pipeline) (int, error) {
++	// Independent contexts prevent races in command-local IO and failure state.
++	// Collect steps by stage index so the public result remains deterministic.
++	steps := make([]stepResult, len(pl.Cmds))
++	stages := make([]streamStage, len(pl.Cmds))
++	for i, c := range pl.Cmds {
++		argv := expandGlobs(rc.j.Workspace, c.Words)
++		stages[i] = func(in io.Reader, out io.Writer) int {
++			child := &runCtx{s: rc.s, j: rc.j, req: rc.req, input: in, output: out}
++			start := time.Now()
++			status := builtins[argv[0]](child, argv[1:])
++			if child.writeErr != nil {
++				status = 1
++			}
++			kind := "builtin"
++			steps[i] = stepResult{Argv: argv, Kind: &kind, State: "exited", ExitCode: intp(status), WallMs: msSince(start)}
++			return status
++		}
++	}
++	out, err := os.OpenFile(rc.stdoutPath(), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
++	if err != nil {
++		return 1, err
++	}
++	defer out.Close()
++	stop, finished, watched := make(chan struct{}), make(chan struct{}), make(chan struct{})
++	go func() {
++		defer close(watched)
++		ticker := time.NewTicker(5 * time.Millisecond)
++		defer ticker.Stop()
++		for {
++			rc.j.mu.Lock()
++			cancelled := rc.j.killed || (!rc.j.deadline.IsZero() && !time.Now().Before(rc.j.deadline))
++			rc.j.mu.Unlock()
++			if cancelled {
++				close(stop)
++				return
++			}
++			select {
++			case <-finished:
++				return
++			case <-ticker.C:
++			}
++		}
++	}()
++	statuses, err := pipeStages(stages, rc.input, out, stop)
++	close(finished)
++	<-watched
++	rc.j.mu.Lock()
++	rc.j.steps = append(rc.j.steps, steps...)
++	expired := !rc.j.deadline.IsZero() && !time.Now().Before(rc.j.deadline)
++	rc.j.mu.Unlock()
++	if expired {
++		rc.abn = &stepResult{State: "timeout", Error: strp("timeout")}
++		err = errStop
++	}
++	return statuses[len(statuses)-1], err
++}
+diff -ruN control.original/pipeline_test.go control/pipeline_test.go
+--- control.original/pipeline_test.go	1970-01-01 00:00:00.000000000 +0000
++++ control/pipeline_test.go	2026-10-15 17:44:45.653547114 +0000
+@@ -0,0 +1,199 @@
++package main
++
++import (
++	"bytes"
++	"io"
++	"os"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestStreamable(t *testing.T) {
++	for _, tc := range []struct {
++		cmd  string
++		want bool
++	}{
++		{"echo hi | cat | cat", true}, {"false | true", true},
++		{"echo hi", false}, {"echo hi | tool", false},
++		{"echo hi > out | cat", false}, {"echo hi | cat < in", false},
++		{"echo hi 2>&1 | cat", false},
++	} {
++		l, err := parseCmd(tc.cmd)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if got := streamable(l.Pipes[0]); got != tc.want {
++			t.Errorf("%s: %v", tc.cmd, got)
++		}
++	}
++}
++
++func TestPipeEarlyConsumer(t *testing.T) {
++	// An unbounded producer must stop as soon as its consumer closes stdin.
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		var out bytes.Buffer
++		stages := []streamStage{
++			func(_ io.Reader, w io.Writer) int {
++				for {
++					if _, err := io.WriteString(w, "yes\n"); err != nil {
++						return 1
++					}
++				}
++			},
++			func(r io.Reader, w io.Writer) int {
++				_, err := io.CopyN(w, r, 12)
++				if err != nil {
++					return 1
++				}
++				return 0
++			},
++		}
++		statuses, err := pipeStages(stages, nil, &out, nil)
++		if err != nil || statuses[0] != 1 || statuses[1] != 0 || out.String() != "yes\nyes\nyes\n" {
++			t.Errorf("statuses=%v err=%v output=%q", statuses, err, out.String())
++		}
++	}()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("producer failed to stop")
++	}
++}
++
++func TestPipeCancellation(t *testing.T) {
++	stop := make(chan struct{})
++	started := make(chan struct{})
++	stages := []streamStage{
++		func(_ io.Reader, w io.Writer) int {
++			close(started)
++			for {
++				if _, err := w.Write([]byte("x")); err != nil {
++					return 1
++				}
++			}
++		},
++		func(r io.Reader, _ io.Writer) int {
++			_, err := io.Copy(io.Discard, r)
++			if err != nil {
++				return 1
++			}
++			return 0
++		},
++	}
++	go func() { <-started; close(stop) }()
++	if _, err := pipeStages(stages, nil, io.Discard, stop); err != errStop {
++		t.Fatalf("got %v", err)
++	}
++}
++
++func TestPipeBackpressure(t *testing.T) {
++	produced := make(chan struct{})
++	stop := make(chan struct{})
++	stages := []streamStage{
++		func(_ io.Reader, w io.Writer) int { w.Write([]byte("x")); close(produced); return 0 },
++		func(r io.Reader, _ io.Writer) int {
++			select {
++			case <-produced:
++				t.Error("write completed before read")
++			default:
++			}
++			b := make([]byte, 1)
++			_, err := io.ReadFull(r, b)
++			if err != nil {
++				return 1
++			}
++			return 0
++		},
++	}
++	statuses, err := pipeStages(stages, nil, io.Discard, stop)
++	if err != nil || statuses[1] != 0 {
++		t.Fatalf("%v %v", statuses, err)
++	}
++}
++
++func TestBuiltinPipeline(t *testing.T) {
++	for _, tc := range []struct {
++		cmd, stdin, want string
++		status           int
++	}{
++		{"echo hello | cat | cat", "", "hello\n", 0},
++		{"cat | cat", "request input\n", "request input\n", 0},
++		{"false | true", "", "", 0}, {"true | false", "", "", 1},
++		{"echo ignored | true | cat", "", "", 0},
++	} {
++		t.Run(tc.cmd, func(t *testing.T) {
++			dir := t.TempDir()
++			if err := os.WriteFile(dir+"/stdin", []byte(tc.stdin), 0600); err != nil {
++				t.Fatal(err)
++			}
++			rc := &runCtx{j: &job{dir: dir}, req: &runRequest{Stdin: tc.stdin}}
++			l, _ := parseCmd(tc.cmd)
++			st, err := rc.runBuiltinPipeline(l.Pipes[0])
++			b, readErr := os.ReadFile(dir + "/stdout")
++			if err != nil || readErr != nil || st != tc.status || string(b) != tc.want {
++				t.Fatalf("status=%d err=%v read=%v output=%q", st, err, readErr, b)
++			}
++			if len(rc.j.steps) != len(l.Pipes[0].Cmds) {
++				t.Fatal("missing steps")
++			}
++			for i, step := range rc.j.steps {
++				if step.Argv[0] != l.Pipes[0].Cmds[i].Words[0] {
++					t.Fatal("steps reordered")
++				}
++			}
++		})
++	}
++}
++
++func TestCatLargeInputAndWriteError(t *testing.T) {
++	input := strings.Repeat("abcdefgh", 1<<18)
++	rc := &runCtx{j: &job{dir: t.TempDir()}, req: &runRequest{}, input: strings.NewReader(input), output: io.Discard}
++	if st := builtinCat(rc, nil); st != 0 {
++		t.Fatalf("cat status %d", st)
++	}
++	r, w := io.Pipe()
++	r.Close()
++	rc.input, rc.output = strings.NewReader("hello"), w
++	if st := builtinCat(rc, nil); st != 1 {
++		t.Fatalf("broken pipe status %d", st)
++	}
++	w.Close()
++}
++
++func TestBuiltinPipelineCancelledJob(t *testing.T) {
++	for _, killed := range []bool{false, true} {
++		j := &job{dir: t.TempDir(), killed: killed}
++		if !killed {
++			j.deadline = time.Now().Add(-time.Second)
++		}
++		rc := &runCtx{j: j, req: &runRequest{}}
++		l, _ := parseCmd("echo hi | cat")
++		_, err := rc.runBuiltinPipeline(l.Pipes[0])
++		if !killed && (err != errStop || rc.abn == nil || rc.abn.State != "timeout") {
++			t.Fatalf("timeout: %v %+v", err, rc.abn)
++		}
++		// drive gives the job's killed flag precedence over stage results.
++		if killed && !j.killed {
++			t.Fatal("lost killed flag")
++		}
++	}
++}
++
++func TestCatRejectsSelfAppend(t *testing.T) {
++	dir := t.TempDir()
++	p := dir + "/same"
++	if err := os.WriteFile(p, []byte("initial"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	rc := &runCtx{j: &job{dir: dir}, req: &runRequest{}, io: cmdIO{stdin: p, stdout: p}}
++	if st := builtinCat(rc, nil); st != 1 {
++		t.Fatalf("self append status %d", st)
++	}
++	b, err := os.ReadFile(p)
++	if err != nil || string(b) != "initial" {
++		t.Fatalf("%q %v", b, err)
++	}
++}
+diff -ruN control.original/sh.go control/sh.go
+--- control.original/sh.go	2026-10-15 16:24:48.000000000 +0000
++++ control/sh.go	2026-10-15 17:42:53.251310341 +0000
+@@ -17,9 +17,8 @@
+ // * ? [ are globs, expanded against the workspace. No variables,
+ // substitutions, subshells, loops or background jobs.
+ //
+-// Pipes are buffered: the stages run one after another, each reading the
+-// previous stage's complete output (fine for build/test pipelines, not
+-// for endless producers).
++// Builtin-only pipelines without redirections stream with backpressure.
++// Other pipelines spool complete stages to disk because host stdio is path-only.
+ 
+ type redir struct {
+ 	Fd     int    // 0 stdin, 1 stdout, 2 stderr
+diff -ruN control.original/shrun.go control/shrun.go
+--- control.original/shrun.go	2026-10-15 16:27:09.000000000 +0000
++++ control/shrun.go	2026-10-15 17:44:45.609547793 +0000
+@@ -41,9 +41,13 @@
+ 	return nil
+ }
+ 
+-// runPipeline runs a | b | c buffered: each stage's stdout goes to a
+-// temp file that is the next stage's stdin. Status = last stage's.
++// runPipeline streams builtin-only pipelines without redirections. Other
++// pipelines spool to disk: the host ABI only accepts regular-file stdio.
++// Status is the last stage's, including when an upstream stage fails.
+ func (rc *runCtx) runPipeline(pl pipeline, idx int) (int, error) {
++	if streamable(pl) {
++		return rc.runBuiltinPipeline(pl)
++	}
+ 	prev := ""
+ 	status := 0
+ 	for k, c := range pl.Cmds {
+@@ -181,15 +185,28 @@
+ 
+ // readInput reads a workspace file ("-" or none = the command's stdin).
+ func (rc *runCtx) readInput(name string) ([]byte, error) {
++	f, err := rc.openInput(name)
++	if err != nil {
++		return nil, err
++	}
++	defer f.Close()
++	return io.ReadAll(f)
++}
++
++// openInput lets cat copy arbitrarily large inputs without materializing them.
++func (rc *runCtx) openInput(name string) (io.ReadCloser, error) {
+ 	if name == "-" {
++		if rc.input != nil {
++			return io.NopCloser(rc.input), nil
++		}
+ 		p := rc.io.stdin
+ 		if p == "" {
+ 			if rc.req.Stdin == "" {
+-				return nil, nil
++				return io.NopCloser(strings.NewReader("")), nil
+ 			}
+ 			p = rc.j.dir + "/stdin"
+ 		}
+-		return os.ReadFile(p)
++		return os.Open(p)
+ 	}
+ 	root, err := os.OpenRoot(wsDir(rc.j.Workspace))
+ 	if err != nil {
+@@ -200,8 +217,7 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	defer f.Close()
+-	return io.ReadAll(f)
++	return f, nil
+ }
+ 
+ func builtinCat(rc *runCtx, args []string) int {
+@@ -209,17 +225,44 @@
+ 		args = []string{"-"}
+ 	}
+ 	status := 0
+-	var out bytes.Buffer
++	var out io.Writer = rc.output
++	if out == nil {
++		f, err := os.OpenFile(rc.stdoutPath(), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
++		if err != nil {
++			rc.stderr(fmt.Sprintf("cat: %s\n", errText(err)))
++			return 1
++		}
++		defer f.Close()
++		out = f
++	}
+ 	for _, a := range args {
+-		b, err := rc.readInput(a)
++		f, err := rc.openInput(a)
+ 		if err != nil {
+ 			rc.stderr(fmt.Sprintf("cat: %s: %s\n", a, errText(err)))
+ 			status = 1
+ 			continue
+ 		}
+-		out.Write(b)
++		// Appending while reading the same regular file would chase our
++		// own output forever now that cat no longer snapshots its input.
++		if inFile, ok := f.(*os.File); ok {
++			if outFile, ok := out.(*os.File); ok {
++				inInfo, inErr := inFile.Stat()
++				outInfo, outErr := outFile.Stat()
++				if inErr == nil && outErr == nil && inInfo.Mode().IsRegular() && os.SameFile(inInfo, outInfo) {
++					f.Close()
++					rc.stderr("cat: input and output are the same file\n")
++					status = 1
++					continue
++				}
++			}
++		}
++		_, err = io.Copy(out, f)
++		f.Close()
++		if err != nil {
++			rc.stderr(fmt.Sprintf("cat: %s\n", errText(err)))
++			return 1
++		}
+ 	}
+-	rc.stdout(out.String())
+ 	return status
+ }
+ 
