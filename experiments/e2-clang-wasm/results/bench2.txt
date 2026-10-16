@@ -1,0 +1,17 @@
+config         input         min_wall   min_cpu  maxrss_KB
+cranelift      hello.c           0.02       .02     102608
+cranelift-O0   hello.c           0.02       .02     104060
+winch          hello.c           0.03       .02     132728
+native18       hello.c           0.01       .01      89608
+cranelift      big.c             0.32       .31     117588
+cranelift-O0   big.c             0.33       .32     119744
+winch          big.c             0.52       .52     152100
+native18       big.c             0.12       .12     111040
+cranelift      -O2 big.c         0.94       .94     125212
+cranelift-O0   -O2 big.c         0.93       .93     129240
+winch          -O2 big.c         1.39      1.38     175744
+native18       -O2 big.c         0.37       .36     101916
+cranelift      hello.cpp         2.34      2.34     152460
+cranelift-O0   hello.cpp         2.18      2.17     155936
+winch          hello.cpp         2.99      2.98     196320
+native18       hello.cpp         0.36       .35     119692

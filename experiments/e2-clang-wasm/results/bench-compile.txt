@@ -1,0 +1,30 @@
+cranelift default (already measured -> llvm.cwasm): 0.00 s wall, 0.00 s user, 1272 KB maxrss
+cranelift opt-level=0: 222.90 s wall, 425.95 s user, 2030896 KB maxrss
+winch: 48.40 s wall, 76.86 s user, 2292608 KB maxrss
+-rw-r--r-- 1 exedev exedev 204640360 Oct 15 12:25 /home/exedev/e2/yowasp/llvm-o0.cwasm
+-rw-r--r-- 1 exedev exedev 321713112 Oct 15 12:26 /home/exedev/e2/yowasp/llvm-winch.cwasm
+-rw-r--r-- 1 exedev exedev 190793880 Oct 15 11:59 /home/exedev/e2/yowasp/llvm.cwasm
+run llvm.cwasm clang -c hello.c: 0.29 s wall, 0.21 s user, 102424 KB maxrss
+run llvm.cwasm clang -c big.c: 1.61 s wall, 1.45 s user, 117404 KB maxrss
+run llvm.cwasm clang -c -O2 big.c: 7.88 s wall, 7.68 s user, 125132 KB maxrss
+run llvm-o0.cwasm clang -c hello.c: 0.10 s wall, 0.08 s user, 103908 KB maxrss
+run llvm-o0.cwasm clang -c big.c: 2.19 s wall, 2.05 s user, 119580 KB maxrss
+run llvm-o0.cwasm clang -c -O2 big.c: 3.20 s wall, 3.15 s user, 129328 KB maxrss
+run llvm-winch.cwasm clang -c hello.c: 0.18 s wall, 0.14 s user, 132284 KB maxrss
+run llvm-winch.cwasm clang -c big.c: 1.99 s wall, 1.93 s user, 152052 KB maxrss
+run llvm-winch.cwasm clang -c -O2 big.c: 6.90 s wall, 6.83 s user, 175716 KB maxrss
+Error: failed to open wasm module "llvm.wasm"
+
+Caused by:
+    No such file or directory (os error 2)
+
+Command exited with non-zero status 1
+wasmtime run llvm.wasm (cache warm, no cwasm): 0.00 s wall, 0.00 s user, 12936 KB maxrss
+Error: failed to open wasm module "llvm.wasm"
+
+Caused by:
+    No such file or directory (os error 2)
+
+Command exited with non-zero status 1
+wasmtime run -C cache=n llvm.wasm (cold JIT): 0.08 s wall, 0.00 s user, 12724 KB maxrss
+62M	/home/exedev/.cache/wasmtime

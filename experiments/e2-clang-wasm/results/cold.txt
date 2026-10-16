@@ -1,0 +1,18 @@
+cold: wasmtime run -C cache=n llvm.wasm clang --version (cranelift JIT, all funcs): 80.73 s wall, 158.41 s user, 1941396 KB maxrss
+cold: wasmtime compile (cranelift) -> cwasm: 101.43 s wall, 196.13 s user, 1944920 KB maxrss
+cold: wasmtime compile -C compiler=winch -> cwasm: 28.60 s wall, 48.49 s user, 2291768 KB maxrss
+warm cache: wasmtime run llvm.wasm clang --version (implicit cache): 1.18 s wall, 0.80 s user, 460344 KB maxrss
+warm cache: wasmtime run llvm.wasm clang --version (implicit cache): 0.83 s wall, 0.56 s user, 460124 KB maxrss
+cwasm: clang --version: 0.07 s wall, 0.04 s user, 60356 KB maxrss
+e2e wcc.py clang hello.c -> hello.wasm: 0.29 s wall, 0.22 s user, 100832 KB maxrss
+e2e wcc.py clang hello.c -> hello.wasm: 0.21 s wall, 0.15 s user, 100952 KB maxrss
+e2e wcc.py clang hello.c -> hello.wasm: 0.29 s wall, 0.21 s user, 101076 KB maxrss
+e2e wcc.py clang -O2 main.c fib.c sum.c: 0.40 s wall, 0.26 s user, 113216 KB maxrss
+e2e wcc.py clang -O2 main.c fib.c sum.c: 0.51 s wall, 0.39 s user, 113520 KB maxrss
+e2e wcc.py clang -O2 main.c fib.c sum.c: 0.48 s wall, 0.38 s user, 113208 KB maxrss
+e2e wcc.py clang++ -O2 -fno-exceptions hello.cpp: 4.41 s wall, 4.28 s user, 163004 KB maxrss
+e2e wcc.py clang++ -O2 -fno-exceptions hello.cpp: 4.37 s wall, 4.19 s user, 162996 KB maxrss
+e2e wcc.py clang++ -O2 -fno-exceptions hello.cpp: 4.91 s wall, 4.75 s user, 162996 KB maxrss
+e2e wcc.py wasip2 tcpserver.c (clang+wasm-ld+wasm-tools.wasm): 0.40 s wall, 0.30 s user, 118948 KB maxrss
+e2e wcc.py wasip2 tcpserver.c (clang+wasm-ld+wasm-tools.wasm): 0.39 s wall, 0.26 s user, 119104 KB maxrss
+e2e wcc.py wasip2 tcpserver.c (clang+wasm-ld+wasm-tools.wasm): 0.48 s wall, 0.33 s user, 118884 KB maxrss

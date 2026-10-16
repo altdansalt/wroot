@@ -1,0 +1,151 @@
+    0.1s b001 b001 0.1s rc=0
+    0.2s b008 internal/unsafeheader 0.1s rc=0
+    0.2s b006 internal/goarch 0.1s rc=0
+    0.8s b011 internal/cpu 0.5s rc=0
+    1.3s b010 internal/bytealg 0.5s rc=0
+    1.7s b012 internal/byteorder 0.4s rc=0
+    2.5s b013 internal/chacha8rand 0.8s rc=0
+    2.7s b014 internal/coverage/rtcov 0.2s rc=0
+    2.9s b015 internal/godebugs 0.2s rc=0
+    3.0s b016 internal/goexperiment 0.1s rc=0
+    3.1s b017 internal/goos 0.1s rc=0
+    3.2s b018 internal/profilerecord 0.1s rc=0
+    4.2s b019 internal/runtime/atomic 1.0s rc=0
+    4.4s b020 internal/runtime/exithook 0.2s rc=0
+    4.7s b021 internal/runtime/gc 0.3s rc=0
+    5.1s b023 internal/runtime/sys 0.4s rc=0
+    5.5s b022 internal/runtime/gc/scan 0.4s rc=0
+    5.6s b025 internal/asan 0.1s rc=0
+    5.8s b026 internal/msan 0.2s rc=0
+    5.9s b028 internal/runtime/math 0.1s rc=0
+    6.2s b029 internal/runtime/pprof/label 0.3s rc=0
+    6.3s b005 internal/abi 6.1s rc=0
+    6.5s b027 internal/race 0.2s rc=0
+    6.8s b031 math/bits 0.6s rc=0
+   10.5s b030 internal/strconv 3.7s rc=0
+   10.9s b032 internal/stringslite 0.4s rc=0
+   11.3s b033 internal/trace/tracev2 0.4s rc=0
+   11.4s b034 structs 0.0s rc=0
+   11.5s b024 internal/runtime/maps 5.0s rc=0
+   12.1s b041 sync/atomic 0.7s rc=0
+   12.4s b040 internal/sync 0.3s rc=0
+   12.6s b042 internal/synctest 0.2s rc=0
+   13.5s b044 unicode/utf8 0.9s rc=0
+   13.6s b046 cmp 0.1s rc=0
+   16.7s b055 math 3.1s rc=0
+   19.5s b057 unicode 2.8s rc=0
+   19.6s b062 encoding 0.1s rc=0
+   19.7s b084 crypto/internal/fips140/alias 0.1s rc=0
+   20.1s b088 crypto/internal/fips140deps/byteorder 0.4s rc=0
+   20.2s b091 crypto/internal/constanttime 0.1s rc=0
+   20.3s b092 crypto/internal/fips140deps/cpu 0.1s rc=0
+   20.6s b100 crypto/internal/boring/sig 0.3s rc=0
+   20.8s b107 unicode/utf16 0.2s rc=0
+   80.1s b009 runtime 68.6s rc=0
+   82.9s b039 sync 2.8s rc=0
+   83.1s b047 iter 0.2s rc=0
+   83.3s b004 internal/reflectlite 3.2s rc=0
+   83.6s b045 slices 0.5s rc=0
+   83.9s b003 errors 0.6s rc=0
+   83.9s b053 internal/testlog 0.3s rc=0
+   83.9s b037 internal/oserror 0.0s rc=0
+   84.6s b043 path 0.7s rc=0
+   85.2s b038 io 1.3s rc=0
+   86.1s b049 syscall 1.5s rc=0
+   86.2s b056 strconv 1.0s rc=0
+   86.5s b051 internal/syscall/unix 0.3s rc=0
+   86.6s b052 internal/syscall/execenv 0.1s rc=0
+   93.1s b048 time 7.0s rc=0
+   95.0s b036 io/fs 1.9s rc=0
+   95.8s b035 internal/filepathlite 0.8s rc=0
+   98.2s b050 internal/poll 2.4s rc=0
+  104.6s b054 reflect 18.0s rc=0
+  106.8s b059 bytes 2.2s rc=0
+  107.8s b060 context 1.0s rc=0
+  108.5s b002 os 10.3s rc=0
+  109.0s b064 internal/fmtsort 1.2s rc=0
+  112.4s b065 strings 3.9s rc=0
+  112.7s b066 internal/sysinfo 0.3s rc=0
+  113.9s b069 internal/bisect 1.2s rc=0
+  115.7s b063 fmt 6.7s rc=0
+  116.1s b068 internal/godebug 2.2s rc=0
+  117.0s b067 math/rand 0.9s rc=0
+  118.2s b061 flag 2.4s rc=0
+  119.2s b070 path/filepath 2.2s rc=0
+  119.8s b071 runtime/debug 1.6s rc=0
+  120.5s b072 runtime/trace 1.3s rc=0
+  122.0s b074 bufio 2.2s rc=0
+  122.3s b078 hash 0.3s rc=0
+  122.8s b077 crypto 0.5s rc=0
+  123.0s b083 crypto/internal/fips140deps/godebug 0.2s rc=0
+  123.4s b082 crypto/internal/fips140 0.4s rc=0
+  124.2s b087 crypto/internal/fips140/sha256 0.8s rc=0
+  124.8s b090 crypto/internal/fips140/subtle 0.6s rc=0
+  126.0s b089 crypto/internal/fips140/sha3 1.2s rc=0
+  127.0s b093 crypto/internal/fips140/sha512 1.0s rc=0
+  127.6s b086 crypto/internal/fips140/hmac 0.6s rc=0
+  128.0s b085 crypto/internal/fips140/check 0.4s rc=0
+  129.3s b081 crypto/internal/fips140/aes 1.3s rc=0
+  129.7s b096 crypto/internal/sysrand 0.4s rc=0
+  130.4s b095 crypto/internal/fips140/drbg 0.7s rc=0
+  131.7s b094 crypto/internal/fips140/aes/gcm 1.3s rc=0
+  132.1s b098 crypto/fips140 0.4s rc=0
+  132.3s b097 crypto/internal/fips140only 0.2s rc=0
+  132.5s b099 crypto/subtle 0.2s rc=0
+  134.2s b080 crypto/cipher 1.7s rc=0
+  134.6s b079 crypto/internal/boring 0.4s rc=0
+  134.8s b076 crypto/sha256 0.2s rc=0
+  136.7s b058 testing 16.2s rc=0
+  136.9s b103 encoding/json/internal 0.2s rc=0
+  137.0s b104 encoding/json/internal/jsonflags 0.1s rc=0
+  137.5s b105 encoding/json/internal/jsonopts 0.5s rc=0
+  140.1s b106 encoding/json/internal/jsonwire 2.6s rc=0
+  140.2s b101 encoding/binary 5.4s rc=0
+  141.3s b110 encoding/base32 1.1s rc=0
+  142.3s b111 encoding/base64 1.0s rc=0
+  143.1s b112 encoding/hex 0.8s rc=0
+  145.2s b115 go/token 2.1s rc=0
+  148.1s b116 sort 2.9s rc=0
+  149.5s b114 go/scanner 1.4s rc=0
+  150.1s b108 encoding/json/jsontext 10.0s rc=0
+  157.6s b113 go/ast 8.1s rc=0
+  158.7s b118 go/build/constraint 1.1s rc=0
+  165.6s b117 go/parser 6.9s rc=0
+  167.7s b119 os/exec 2.1s rc=0
+  168.5s b120 os/signal 0.8s rc=0
+  171.6s b109 encoding/json/v2 21.5s rc=0
+  174.5s b122 regexp/syntax 6.0s rc=0
+  174.9s b102 encoding/json 3.3s rc=0
+  181.9s b075 internal/fuzz 7.0s rc=0
+  182.5s b121 regexp 8.0s rc=0
+  183.2s b126 hash/crc32 0.7s rc=0
+  184.0s b127 text/tabwriter 0.8s rc=0
+  188.1s b125 compress/flate 6.2s rc=0
+  189.3s b124 compress/gzip 1.2s rc=0
+  197.7s b123 runtime/pprof 8.4s rc=0
+  198.7s b073 testing/internal/testdeps 1.0s rc=0
+Traceback (most recent call last):
+  File "/home/exedev/e1/runplan.py", line 103, in <module>
+    b, rc, out, dt = f.result()
+                     ^^^^^^^^^^
+  File "/usr/lib/python3.12/concurrent/futures/_base.py", line 449, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/concurrent/futures/_base.py", line 401, in __get_result
+    raise self._exception
+  File "/usr/lib/python3.12/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/exedev/e1/runplan.py", line 89, in run
+    p = subprocess.run(["bash", "-c", script(b)], capture_output=True, text=True)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 1026, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/usr/lib/python3.12/subprocess.py", line 1955, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+OSError: [Errno 7] Argument list too long: 'bash'
+Command exited with non-zero status 1
+wall 199.69 s maxrss 549256 KB

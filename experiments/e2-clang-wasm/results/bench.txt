@@ -1,0 +1,20 @@
+wasm: clang --version (cwasm load)                   0.10 s     60796 KB
+wasm: hello.c -c -O0                                 0.11 s    102688 KB
+wasm: hello.c -c -O2                                 0.18 s    110796 KB
+wasm: big.c (2.2k lines) -c -O0                      1.30 s    117512 KB
+wasm: big.c (2.2k lines) -c -O2                      3.40 s    125244 KB
+wasm: hello.cpp (iostream) -c -O0 -fno-exc           8.69 s    152208 KB
+wasm: hello.cpp (iostream) -c -O2 -fno-exc          11.39 s    164112 KB
+wasm: wasm-ld hello                                  0.20 s     69600 KB
+wasm: wcc.py clang hello.c (driver+cc1+ld)           0.70 s    101000 KB
+native18->wasm32: hello.c -c -O0                     0.10 s     89420 KB
+native18->wasm32: big.c -c -O0                       0.99 s    110320 KB
+native18->wasm32: big.c -c -O2                       3.08 s    101636 KB
+  (native18->wasm32: hello.cpp -c -O0 -fno-exc: exit 1)
+  (native18->wasm32: hello.cpp -c -O0 -fno-exc: exit 1)
+  (native18->wasm32: hello.cpp -c -O0 -fno-exc: exit 1)
+native18->wasm32: hello.cpp -c -O0 -fno-exc          3.99 s    134320 KB
+  (native18->wasm32: hello.cpp -c -O2 -fno-exc: exit 1)
+  (native18->wasm32: hello.cpp -c -O2 -fno-exc: exit 1)
+  (native18->wasm32: hello.cpp -c -O2 -fno-exc: exit 1)
+native18->wasm32: hello.cpp -c -O2 -fno-exc          3.81 s    134600 KB

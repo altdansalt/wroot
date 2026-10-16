@@ -1,0 +1,27 @@
+native -c=2	0.48	0.59	76560
+native -c=2	0.42	0.60	75608
+native -c=2	0.39	0.59	77008
+native -c=1	0.60	0.69	45636
+native -c=1	0.60	0.60	45964
+native -c=1	0.67	0.64	46788
+native -c=1 GOMAXPROCS=1	0.62	0.57	50052
+native -c=1 GOMAXPROCS=1	0.67	0.66	46924
+native -c=1 GOMAXPROCS=1	0.69	0.65	53384
+wasm cranelift o2 cwasm	2.70	2.64	128268
+wasm cranelift o2 cwasm	2.52	2.43	127000
+wasm cranelift o2 cwasm	2.68	2.59	128472
+wasm cranelift o0 cwasm	3.18	3.07	133348
+wasm cranelift o0 cwasm	3.02	2.96	133516
+wasm cranelift o0 cwasm	3.29	3.21	133536
+wasm winch cwasm	3.28	3.22	143500
+wasm winch cwasm	4.31	4.25	143536
+wasm winch cwasm	3.59	3.52	143280
+wasm o2 GOGC=200	3.78	3.62	119408
+wasm o2 GOGC=200	3.63	3.55	118256
+wasm o2 GOGC=200	3.28	3.13	108008
+wasm o2 GOGC=off	2.92	2.86	127804
+wasm o2 GOGC=off	1.99	1.88	128284
+wasm o2 GOGC=off	2.16	2.10	128012
+wasm o2 no-signals-traps	3.18	3.04	170392
+wasm o2 no-signals-traps	3.10	3.05	170328
+wasm o2 no-signals-traps	3.21	3.07	170076
